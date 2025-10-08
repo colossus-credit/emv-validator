@@ -1,0 +1,11 @@
+ExcessivelySafeCall/=lib/kernel/lib/ExcessivelySafeCall/src/
+SolRsaVerify/=lib/SolRsaVerify/
+account-abstraction/=lib/kernel/lib/account-abstraction/contracts/
+ds-test/=lib/SolRsaVerify/lib/forge-std/lib/ds-test/src/
+forge-std/=lib/forge-std/src/
+kernel/=lib/kernel/
+openzeppelin-contracts/=lib/kernel/lib/openzeppelin-contracts/
+solady/=lib/solady/src/
+solady_test/=lib/kernel/lib/solady/test/
+src/=lib/kernel/src/
+
