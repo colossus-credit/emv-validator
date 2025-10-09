@@ -12,4 +12,5 @@
 	url = https://github.com/adria0/SolRsaVerify
 [submodule "lib/kernel"]
 	path = lib/kernel
-	url = https://github.com/zerodevapp/kernel
+	url = https://github.com/colossus-credit/kernel.git
+	branch = dev
