@@ -5,7 +5,6 @@ pragma solidity ^0.8.26;
 import {RsaVerifyOptimized} from "lib/SolRsaVerify/src/RsaVerifyOptimized.sol";
 import {IValidator, IExecutor, IHook} from "src/interfaces/IERC7579Modules.sol";
 import {PackedUserOperation} from "src/interfaces/PackedUserOperation.sol";
-import "forge-std/console.sol";
 import {
     SIG_VALIDATION_SUCCESS_UINT,
     SIG_VALIDATION_FAILED_UINT,
@@ -15,7 +14,6 @@ import {
     ERC1271_MAGICVALUE,
     ERC1271_INVALID
 } from "src/types/Constants.sol";
-import {EMVSettlement} from "./EMVSettlement.sol";
 import {ExecLib} from "src/utils/ExecLib.sol";
 import {ExecMode, CallType} from "src/types/Types.sol";
 
