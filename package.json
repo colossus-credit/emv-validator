@@ -1,0 +1,13 @@
+{
+  "name":"kernel",
+  "version":"3.0.0",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "forge test",
+    "test:emv": "forge test --match-contract EMVValidatorTest",
+    "coverage": "forge coverage --no-match-test testFuzz --ir-minimum",
+    "coverage:summary": "forge coverage --no-match-test testFuzz --ir-minimum --report summary",
+    "report": "forge coverage --no-match-test testFuzz --ir-minimum --report lcov && perl -pi -e 's|#!/usr/bin/perl5.30|#!/usr/bin/perl|' $(which genhtml 2>/dev/null || echo /usr/local/Cellar/lcov/*/libexec/bin/genhtml) && genhtml -o report --branch-coverage --ignore-errors source lcov.info && rm lcov.info"
+  }
+}
