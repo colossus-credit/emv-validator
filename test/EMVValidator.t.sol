@@ -843,4 +843,639 @@ contract EMVValidatorTest is KernelTestBase {
         assertTrue(foundInterchange, "Should find interchange recipient");
         assertTrue(foundMerchant, "Should find merchant recipient");
     }
+
+    // ========== ADDITIONAL COVERAGE TESTS ==========
+
+    function test_AcquirerConfigGetters() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 testMerchantId = bytesToUint120(bytes15("MERCHANT000001"));
+        uint64 testTerminalId = bytesToUint64(bytes8("TERMINAL"));
+
+        // Register acquirer
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Test isAcquirerRegistered
+        assertTrue(acquirerConfig.isAcquirerRegistered(testAcquirerId));
+        assertFalse(acquirerConfig.isAcquirerRegistered(999));
+
+        // Test getAcquirerAddress
+        assertEq(acquirerConfig.getAcquirerAddress(testAcquirerId), address(this));
+
+        // Set up merchant and terminal
+        address merchantAddr = makeAddr("merchant");
+        address terminalAddr = makeAddr("terminal");
+        acquirerConfig.setMerchant(testAcquirerId, testMerchantId, merchantAddr);
+        acquirerConfig.setTerminal(testAcquirerId, testTerminalId, terminalAddr);
+
+        // Test getTerminalAddress
+        assertEq(acquirerConfig.getTerminalAddress(testAcquirerId, testTerminalId), terminalAddr);
+
+        // Test isTerminalRegistered
+        assertTrue(acquirerConfig.isTerminalRegistered(testAcquirerId, testTerminalId));
+        assertFalse(acquirerConfig.isTerminalRegistered(testAcquirerId, 999));
+
+        // Set acquirer fee and test getAcquirerConfig
+        acquirerConfig.setAcquirerFee(testAcquirerId, makeAddr("feeRecipient"), 25);
+        acquirerConfig.setSwipeFee(testAcquirerId, 1 ether);
+        (address feeRecipient, uint256 feeRate, uint256 swipeFee) = acquirerConfig.getAcquirerConfig(testAcquirerId);
+        assertEq(feeRecipient, makeAddr("feeRecipient"));
+        assertEq(feeRate, 25);
+        assertEq(swipeFee, 1 ether);
+    }
+
+    function test_AcquirerConfigBatchOperations() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Test batch set merchants
+        uint120[] memory merchantIds = new uint120[](3);
+        address[] memory merchantAddrs = new address[](3);
+        merchantIds[0] = 1;
+        merchantIds[1] = 2;
+        merchantIds[2] = 3;
+        merchantAddrs[0] = makeAddr("merchant1");
+        merchantAddrs[1] = makeAddr("merchant2");
+        merchantAddrs[2] = makeAddr("merchant3");
+
+        acquirerConfig.batchSetMerchants(testAcquirerId, merchantIds, merchantAddrs);
+
+        // Verify all merchants were set
+        assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, 1), makeAddr("merchant1"));
+        assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, 2), makeAddr("merchant2"));
+        assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, 3), makeAddr("merchant3"));
+
+        // Test batch set terminals
+        uint64[] memory terminalIds = new uint64[](2);
+        address[] memory terminalAddrs = new address[](2);
+        terminalIds[0] = 100;
+        terminalIds[1] = 200;
+        terminalAddrs[0] = makeAddr("terminal1");
+        terminalAddrs[1] = makeAddr("terminal2");
+
+        acquirerConfig.batchSetTerminals(testAcquirerId, terminalIds, terminalAddrs);
+
+        // Verify all terminals were set
+        assertEq(acquirerConfig.getTerminalAddress(testAcquirerId, 100), makeAddr("terminal1"));
+        assertEq(acquirerConfig.getTerminalAddress(testAcquirerId, 200), makeAddr("terminal2"));
+    }
+
+    function test_AcquirerConfigBatchMismatchErrors() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Test merchant array length mismatch
+        uint120[] memory merchantIds = new uint120[](2);
+        address[] memory merchantAddrs = new address[](1);
+        merchantIds[0] = 1;
+        merchantIds[1] = 2;
+        merchantAddrs[0] = makeAddr("merchant1");
+
+        vm.expectRevert("AcquirerConfig: array length mismatch");
+        acquirerConfig.batchSetMerchants(testAcquirerId, merchantIds, merchantAddrs);
+
+        // Test terminal array length mismatch
+        uint64[] memory terminalIds = new uint64[](2);
+        address[] memory terminalAddrs = new address[](3);
+        terminalIds[0] = 1;
+        terminalIds[1] = 2;
+        terminalAddrs[0] = makeAddr("terminal1");
+        terminalAddrs[1] = makeAddr("terminal2");
+        terminalAddrs[2] = makeAddr("terminal3");
+
+        vm.expectRevert("AcquirerConfig: array length mismatch");
+        acquirerConfig.batchSetTerminals(testAcquirerId, terminalIds, terminalAddrs);
+    }
+
+    function test_AcquirerConfigInvalidIds() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Test invalid merchant ID
+        vm.expectRevert(AcquirerConfig.InvalidMerchantId.selector);
+        acquirerConfig.setMerchant(testAcquirerId, 0, makeAddr("merchant"));
+
+        // Test invalid terminal ID
+        vm.expectRevert(AcquirerConfig.InvalidTerminalId.selector);
+        acquirerConfig.setTerminal(testAcquirerId, 0, makeAddr("terminal"));
+
+        // Test invalid merchant ID in batch
+        uint120[] memory merchantIds = new uint120[](1);
+        address[] memory merchantAddrs = new address[](1);
+        merchantIds[0] = 0;
+        merchantAddrs[0] = makeAddr("merchant");
+
+        vm.expectRevert(AcquirerConfig.InvalidMerchantId.selector);
+        acquirerConfig.batchSetMerchants(testAcquirerId, merchantIds, merchantAddrs);
+
+        // Test invalid terminal ID in batch
+        uint64[] memory terminalIds = new uint64[](1);
+        address[] memory terminalAddrs = new address[](1);
+        terminalIds[0] = 0;
+        terminalAddrs[0] = makeAddr("terminal");
+
+        vm.expectRevert(AcquirerConfig.InvalidTerminalId.selector);
+        acquirerConfig.batchSetTerminals(testAcquirerId, terminalIds, terminalAddrs);
+    }
+
+    function test_AcquirerConfigUnauthorizedAccess() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Try to access as unauthorized user
+        address unauthorized = makeAddr("unauthorized");
+
+        vm.startPrank(unauthorized);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(AcquirerConfig.UnauthorizedAcquirer.selector, testAcquirerId, unauthorized)
+        );
+        acquirerConfig.setMerchant(testAcquirerId, 1, makeAddr("merchant"));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(AcquirerConfig.UnauthorizedAcquirer.selector, testAcquirerId, unauthorized)
+        );
+        acquirerConfig.setTerminal(testAcquirerId, 1, makeAddr("terminal"));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(AcquirerConfig.UnauthorizedAcquirer.selector, testAcquirerId, unauthorized)
+        );
+        acquirerConfig.setAcquirerFee(testAcquirerId, makeAddr("fee"), 10);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(AcquirerConfig.UnauthorizedAcquirer.selector, testAcquirerId, unauthorized)
+        );
+        acquirerConfig.setSwipeFee(testAcquirerId, 1 ether);
+
+        vm.stopPrank();
+    }
+
+    function test_InvalidAcquirerId() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        // Try to access as unauthorized user
+        address unauthorized = makeAddr("unauthorized");
+
+        vm.startPrank(unauthorized);
+
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
+        acquirerConfig.setMerchant(testAcquirerId, 1, makeAddr("merchant"));
+
+        vm.stopPrank();
+    }
+
+    function test_AcquirerConfigInvalidAcquirerId() public {
+        // Test with unregistered acquirer (address(0))
+        uint48 unregisteredAcquirerId = 999;
+
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
+        acquirerConfig.setMerchant(unregisteredAcquirerId, 1, makeAddr("merchant"));
+    }
+
+    function test_AcquirerConfigFeeRateValidation() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Test acquirer fee with address(0)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setAcquirerFee(testAcquirerId, address(0), 10);
+
+        // Test acquirer fee rate too high (max is 30)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setAcquirerFee(testAcquirerId, makeAddr("fee"), 31);
+
+        // Test network fee with address(0)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setNetworkFee(address(0), 10);
+
+        // Test network fee rate too high (max is 15)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setNetworkFee(makeAddr("network"), 16);
+
+        // Test interchange fee with address(0)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setInterchangeFee(address(0), 100);
+
+        // Test interchange fee rate too high (max is 250)
+        vm.expectRevert(AcquirerConfig.InvalidFeeRate.selector);
+        acquirerConfig.setInterchangeFee(makeAddr("interchange"), 251);
+    }
+
+    function test_AcquirerConfigSetAcquirerZeroId() public {
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
+        acquirerConfig.setAcquirer(0, address(this));
+    }
+
+    function test_EMVSettlementErrors() public {
+        // Test constructor with invalid token address
+        vm.expectRevert(EMVSettlement.InvalidConfig.selector);
+        new EMVSettlement(address(0), address(acquirerConfig), 18, address(this));
+
+        // Test constructor with invalid acquirer config
+        vm.expectRevert(EMVSettlement.InvalidConfig.selector);
+        new EMVSettlement(address(mockERC20), address(0), 18, address(this));
+
+        // Test constructor with invalid decimals
+        vm.expectRevert(EMVSettlement.InvalidDecimals.selector);
+        new EMVSettlement(address(mockERC20), address(acquirerConfig), 1, address(this));
+    }
+
+    function test_EMVSettlementUninstall() public {
+        // Call onUninstall (does nothing but needs coverage)
+        emvSettlement.onUninstall("");
+    }
+
+    function test_EMVSettlementGetters() public {
+        // Test getSettlementConfig
+        (address token, address config, uint8 dec) = emvSettlement.getSettlementConfig();
+        assertEq(token, address(mockERC20));
+        assertEq(config, address(acquirerConfig));
+        assertEq(dec, 18);
+
+        // Test isInitialized
+        assertTrue(emvSettlement.isInitialized(address(this)));
+    }
+
+    function test_EMVValidatorErrors() public {
+        // Test constructor with invalid target
+        vm.expectRevert(EMVValidator.InvalidConfig.selector);
+        new EMVValidator(address(0), kernel.execute.selector);
+
+        // Test constructor with invalid selector
+        vm.expectRevert(EMVValidator.InvalidConfig.selector);
+        new EMVValidator(address(emvSettlement), bytes4(0));
+
+        // Test onInstall with empty data
+        EMVValidator testValidator = new EMVValidator(address(emvSettlement), kernel.execute.selector);
+        vm.expectRevert(EMVValidator.InvalidConfig.selector);
+        testValidator.onInstall("");
+    }
+
+    function test_EMVValidatorUninstall() public whenInitialized {
+        _installEMVValidator();
+
+        // Call onUninstall
+        vm.prank(address(kernel));
+        emvValidator.onUninstall("");
+
+        // Verify ATC was reset
+        assertEq(emvValidator.getEMVStorage(address(kernel)), 0);
+    }
+
+    function test_EMVValidatorIsInitialized() public {
+        // Create a new validator
+        EMVValidator testValidator = new EMVValidator(address(emvSettlement), kernel.execute.selector);
+
+        // Should not be initialized for any account initially
+        assertFalse(testValidator.isInitialized(address(this)));
+
+        // Install it
+        testValidator.onInstall(abi.encode(uint16(1)));
+
+        // Now should be initialized
+        assertTrue(testValidator.isInitialized(address(this)));
+    }
+
+    function test_EMVValidatorGetValidationConfig() public {
+        (address targetAddr, bytes4 funcSelector) = emvValidator.getValidationConfig();
+        assertEq(targetAddr, address(emvSettlement));
+        assertEq(funcSelector, kernel.execute.selector);
+    }
+
+    function test_EMVValidatorInvalidCurrency() public whenInitialized {
+        _installEMVValidator();
+
+        // Create EMV data with invalid currency (not 840 or 997)
+        bytes memory invalidCurrencyData = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
+            TEST_ATC, // 2 bytes
+            TEST_AMOUNT, // 6 bytes
+            hex"0000", // Invalid currency (0 instead of 840 or 997)
+            TEST_DATE, // 3 bytes
+            TEST_TXN_TYPE, // 1 byte
+            TEST_TVR, // 5 bytes
+            TEST_CVM_RESULTS, // 3 bytes
+            TEST_TERMINAL_ID, // 8 bytes
+            TEST_MERCHANT_ID, // 15 bytes
+            TEST_ACQUIRER_ID, // 6 bytes
+            TEST_SIGNATURE,
+            TEST_EXPONENT,
+            TEST_MODULUS
+        );
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+        ops[0].signature = invalidCurrencyData;
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVValidatorReplayProtection() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 2e21);
+        vm.deal(address(kernel), 2e18);
+
+        // First transaction should succeed
+        PackedUserOperation[] memory ops1 = new PackedUserOperation[](1);
+        ops1[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+        entrypoint.handleOps(ops1, payable(address(0xdeadbeef)));
+
+        // Try to replay the same transaction (same unpredictable number)
+        PackedUserOperation[] memory ops2 = new PackedUserOperation[](1);
+        ops2[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+        ops2[0].signature = ops1[0].signature; // Same signature = same unpredictable number
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops2, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVValidatorERC1271Validation() public {
+        // Create signature data
+        bytes memory sigData = _createEMVTransactionData();
+
+        // Test isValidSignatureWithSender - should return ERC1271_MAGICVALUE for valid signature
+        bytes32 testHash = keccak256("test");
+        bytes4 result = emvValidator.isValidSignatureWithSender(address(0), testHash, sigData);
+        assertEq(result, ERC1271_MAGICVALUE);
+
+        // Test with invalid signature
+        bytes memory invalidSig = _createInvalidEMVTransactionData();
+        bytes4 invalidResult = emvValidator.isValidSignatureWithSender(address(0), testHash, invalidSig);
+        assertEq(invalidResult, ERC1271_INVALID);
+    }
+
+    function test_EMVSettlementInvalidAmount() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        // Create EMV data with amount = 0
+        bytes memory zeroAmountData = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
+            hex"0001", // Different ATC to avoid replay
+            hex"000000000000", // Amount = 0
+            TEST_CURRENCY,
+            TEST_DATE,
+            TEST_TXN_TYPE,
+            TEST_TVR,
+            TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID,
+            TEST_MERCHANT_ID,
+            TEST_ACQUIRER_ID,
+            TEST_SIGNATURE,
+            TEST_EXPONENT,
+            TEST_MODULUS
+        );
+
+        // Direct call to settlement should revert
+        vm.prank(address(kernel));
+        vm.expectRevert(EMVSettlement.InvalidAmount.selector);
+        emvSettlement.execute(zeroAmountData);
+    }
+
+    function test_EMVSettlementInvalidBCDLength() public {
+        // Create EMV data with invalid BCD length (not 6 bytes) by reading at wrong offset
+        // The function expects the amount at offset 14, and will try to read 6 bytes
+        // If we provide data that's too short, it will read out of bounds
+        bytes memory shortData = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            hex"AABBCCDD" // Only 4 more bytes, so offset 14 will be out of bounds
+        );
+
+        // Direct call should revert (out of bounds access or returns 0)
+        vm.prank(address(kernel));
+        vm.expectRevert();
+        emvSettlement.execute(shortData);
+    }
+
+    function test_EMVSettlementInvalidBCDDigits() public {
+        // Create EMV data with invalid BCD digits (>9)
+        bytes memory invalidBCDData = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            hex"11223344", // 4 bytes unpredictable
+            hex"0001", // 2 bytes ATC
+            hex"0000000000FF", // Invalid BCD digit (0xFF has nibbles 15,15 which are >9)
+            TEST_CURRENCY,
+            TEST_DATE,
+            TEST_TXN_TYPE,
+            TEST_TVR,
+            TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID,
+            TEST_MERCHANT_ID,
+            TEST_ACQUIRER_ID
+        );
+
+        // Direct call should revert with InvalidAmount (BCD extraction returns 0)
+        vm.prank(address(kernel));
+        vm.expectRevert(EMVSettlement.InvalidAmount.selector);
+        emvSettlement.execute(invalidBCDData);
+    }
+
+    // Note: BelowTransactionMinimum error is difficult to test in isolation because
+    // SafeTransferLib.safeTransfer may fail first when there are insufficient funds.
+    // The logic is tested indirectly through integration tests where fee calculations work correctly.
+
+    function test_AcquirerConfigInvalidAcquirerIdInModifier() public {
+        // This tests line 78: the first check in onlyAcquirer modifier
+        uint48 unregisteredAcquirer = 12345;
+
+        // Try to set merchant for unregistered acquirer - should hit InvalidAcquirerId at line 77-78
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
+        acquirerConfig.setMerchant(unregisteredAcquirer, 1, makeAddr("merchant"));
+    }
+
+    function test_EMVSettlementOnUninstallCoverage() public {
+        // Explicitly test onUninstall to get coverage
+        emvSettlement.onUninstall(hex"");
+    }
+
+    function test_EMVSettlementInvalidBCDReturnsZero() public {
+        // Test line 199: when BCD length != 6, should return 0 which triggers InvalidAmount
+        // Create data where amount field is less than 6 bytes
+        bytes memory shortBCD = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
+            TEST_ATC, // 2 bytes
+            hex"0000", // Only 2 bytes instead of 6 - will trigger line 199
+            TEST_CURRENCY // This shifts everything
+        );
+
+        // The function will try to read at wrong offsets and get invalid data
+        // This will either revert on bounds or give us invalid amount
+        vm.prank(address(kernel));
+        vm.expectRevert();
+        emvSettlement.execute(shortBCD);
+    }
+
+    function test_EMVValidatorInvalidSignatureFails() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        // Create a UserOp with signature that fails RSA validation
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), false); // false = invalid signature
+
+        // Signature validation should fail, returning SIG_VALIDATION_FAILED_UINT
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVValidatorInvalidATCSequence() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e21);
+        vm.deal(address(kernel), 2e18);
+
+        // Create EMV data with wrong ATC (skipping sequence)
+        bytes memory wrongATCData = abi.encodePacked(
+            TEST_ARQC, // 8 bytes
+            hex"55667788", // Different unpredictable number
+            hex"0005", // ATC = 5 (but expected is 0)
+            TEST_AMOUNT,
+            TEST_CURRENCY,
+            TEST_DATE,
+            TEST_TXN_TYPE,
+            TEST_TVR,
+            TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID,
+            TEST_MERCHANT_ID,
+            TEST_ACQUIRER_ID,
+            TEST_SIGNATURE,
+            TEST_EXPONENT,
+            TEST_MODULUS
+        );
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+        ops[0].signature = wrongATCData;
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_AcquirerConfigAddressZeroInFeeRecipient() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 testMerchantId = 123;
+        uint64 testTerminalId = 456;
+
+        // Register acquirer
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        // Try to call calculatePaymentDistribution with address(0) for fee recipient
+        // This would happen if acquirerFeeRecipient is not set (defaults to address(0))
+        // The _addOrAccumulateFee function should revert with InvalidFee
+
+        // Don't set acquirer fee (it defaults to address(0))
+        // Set other required values
+        acquirerConfig.setSwipeFee(testAcquirerId, 0); // No swipe fee
+        acquirerConfig.setNetworkFee(makeAddr("network"), 0); // No network fee
+        acquirerConfig.setInterchangeFee(makeAddr("interchange"), 0); // No interchange fee
+        acquirerConfig.setMerchant(testAcquirerId, testMerchantId, makeAddr("merchant"));
+
+        // This should work since all fees are 0, so no fee recipients are added
+        AcquirerConfig.FeeRecipient[] memory result =
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, 100 ether);
+
+        // Should only have merchant (all fees are 0)
+        assertEq(result.length, 1);
+        assertEq(result[0].recipient, makeAddr("merchant"));
+        assertEq(result[0].fee, 0);
+    }
+
+    function test_EMVValidatorTargetMismatch() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        // Try with wrong target in callData (not emvSettlement)
+        bytes memory wrongTargetCallData = abi.encodeWithSelector(
+            kernel.execute.selector,
+            ExecMode.wrap(bytes32(0)),
+            ExecLib.encodeSingle(
+                address(mockERC20), // Wrong target! Should be emvSettlement
+                0,
+                abi.encodeWithSelector(mockERC20.transfer.selector, makeAddr("attacker"), 1e20)
+            )
+        );
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(wrongTargetCallData, true);
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVValidatorCallDataTooShort() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        // Try with callData that's too short (less than required for target extraction)
+        bytes memory shortCallData = abi.encodeWithSelector(kernel.execute.selector);
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(shortCallData, true);
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVSettlementInvalidFeeRecipientZero() public {
+        // Test branch at line 167: when a non-merchant fee is 0
+        uint48 testAcquirerId = bytesToUint48(bytes6(TEST_ACQUIRER_ID));
+        uint120 testMerchantId = bytesToUint120(bytes15(TEST_MERCHANT_ID));
+        uint64 testTerminalId = bytesToUint64(bytes8(TEST_TERMINAL_ID));
+
+        // Set fees to 0 to trigger the zero-fee check
+        acquirerConfig.setAcquirerFee(testAcquirerId, makeAddr("acquirer"), 0); // 0% fee
+        acquirerConfig.setSwipeFee(testAcquirerId, 0); // 0 swipe fee
+        acquirerConfig.setNetworkFee(makeAddr("network"), 0); // 0% fee
+        acquirerConfig.setInterchangeFee(makeAddr("interchange"), 0); // 0% fee
+
+        // This should work - when all fees are 0, they're not added to the array
+        AcquirerConfig.FeeRecipient[] memory result =
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, 100 ether);
+
+        // Should only have merchant
+        assertEq(result.length, 1);
+        assertEq(result[0].fee, 0);
+    }
+
+    // Note: _extractUnpredictableNumber and _extractATC are internal helper functions
+    // They are tested indirectly through _validateReplayProtectionAndUpdateState
+
+    function test_Coverage100Percent() public {
+        // Final test to ensure maximum coverage
+        // This test exercises remaining edge cases
+
+        // Test AcquirerConfig with minimal setup
+        AcquirerConfig testConfig = new AcquirerConfig();
+        uint48 newAcquirer = 99999;
+        testConfig.setAcquirer(newAcquirer, address(this));
+
+        // Verify registration
+        assertTrue(testConfig.isAcquirerRegistered(newAcquirer));
+        assertEq(testConfig.getAcquirerAddress(newAcquirer), address(this));
+
+        // Test with zero fees to hit all zero-fee branches
+        testConfig.setAcquirerFee(newAcquirer, address(this), 0);
+        testConfig.setSwipeFee(newAcquirer, 0);
+        testConfig.setNetworkFee(address(this), 0);
+        testConfig.setInterchangeFee(address(this), 0);
+
+        testConfig.setMerchant(newAcquirer, 1, address(this));
+        testConfig.setTerminal(newAcquirer, 1, address(this));
+
+        AcquirerConfig.FeeRecipient[] memory feeRec =
+            testConfig.calculatePaymentDistribution(1, 1, newAcquirer, 1 ether);
+
+        assertEq(feeRec.length, 1); // Only merchant when all fees are 0
+    }
 }

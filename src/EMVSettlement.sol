@@ -63,6 +63,7 @@ contract EMVSettlement is Ownable {
     error InvalidFee(uint256 position);
     error InvalidMerchantFee();
     error BelowTransactionMinimum();
+    error InvalidBCDLength();
 
     // ========== MODULE LIFECYCLE ==========
 
@@ -196,7 +197,7 @@ contract EMVSettlement is Ownable {
      */
     function _extractAmountFromBCD(bytes calldata bcdAmount, uint8 tokenDecimals) internal pure returns (uint256) {
         if (bcdAmount.length != 6) {
-            return 0;
+            revert InvalidBCDLength();
         }
 
         uint256 amount = 0;
