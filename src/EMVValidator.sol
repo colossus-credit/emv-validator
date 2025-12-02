@@ -152,8 +152,8 @@ contract EMVValidator is IValidator {
     /**
      * @dev Validate EMV CDA signature for ERC-4337 user operation
      * @param userOp The user operation with EMV fields in callData and RSA signature in signature field
-     * @param userOpHash The hash of the user operation, unused because we are using a sha256 hash of the dynamic data
      * @return SIG_VALIDATION_SUCCESS_UINT if valid, SIG_VALIDATION_FAILED_UINT otherwise
+     * @notice The userOpHash parameter is unused as we use SHA-256 hash of the EMV dynamic data
      */
     function validateUserOp(PackedUserOperation calldata userOp, bytes32 /* userOpHash */)
         external

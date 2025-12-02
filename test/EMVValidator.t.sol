@@ -555,6 +555,45 @@ contract EMVValidatorTest is KernelTestBase {
         );
     }
 
+    function test_GasMeasurement_CompleteEMVTransaction() public whenInitialized {
+        // Comprehensive gas measurement test for complete EMV flow through entrypoint
+        // This test measures the TOTAL gas cost of an EMV transaction from start to finish
+        
+        _installEMVValidator();
+
+        // Fund the kernel
+        mockERC20.transfer(address(kernel), 1e21); // 1000 tokens
+        vm.deal(address(kernel), 10 ether);
+
+        uint256 merchantBalanceBefore = mockERC20.balanceOf(merchantAddress);
+
+        // Create a UserOperation using EMVValidator
+        PackedUserOperation memory userOp = _prepareEMVUserOp(
+            _encodeSimpleTransferCall(),
+            true // successful signature
+        );
+
+        // Execute through EntryPoint
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = userOp;
+        
+        // Measure gas for the complete transaction
+        uint256 gasBefore = gasleft();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+        uint256 gasUsed = gasBefore - gasleft();
+
+        // Verify transaction succeeded
+        uint256 merchantBalanceAfter = mockERC20.balanceOf(merchantAddress);
+        assertGt(merchantBalanceAfter, merchantBalanceBefore, "Merchant should have received tokens");
+
+        // Report gas usage
+        console.log("\n========== GAS MEASUREMENT: Complete EMV Transaction ==========");
+        console.log("Total gas used:", gasUsed);
+
+        // The gas used by this test will be captured by forge snapshot
+        // Run: forge snapshot --match-test test_GasMeasurement_CompleteEMVTransaction
+    }
+
     // ========== ACQUIRER CONFIG TESTS ==========
 
     function test_AcquirerConfigBasics() public {
@@ -1555,5 +1594,307 @@ contract EMVValidatorTest is KernelTestBase {
         
         vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidRSAKeySize.selector, 0));
         emvValidator.isValidSignatureWithSender(address(this), dynamicDataHash, emptySignature);
+    }
+
+    // ========== FFI TESTS ==========
+
+    function test_FFI_CompleteEndToEndTransaction() public whenInitialized {
+        // Complete end-to-end test: Generate key, install modules, fund, sign, and execute transaction
+        // This uses a specific amount to avoid fuzz complexity
+        
+        // Ensure kernel has ETH for gas
+        vm.deal(address(kernel), 10 ether);
+        
+        // STEP 1: Generate RSA key, EMV data, and signature via FFI
+        string[] memory inputs = new string[](9);
+        inputs[0] = "node";
+        inputs[1] = "script/ffi-emv-test.js";
+        inputs[2] = "10000"; // $100.00 in cents
+        inputs[3] = "840"; // USD
+        inputs[4] = "0"; // ATC = 0
+        inputs[5] = "E2EMERCHANT001"; // Merchant ID
+        inputs[6] = "E2ETERM1"; // Terminal ID
+        inputs[7] = "E2EACQ"; // Acquirer ID
+        
+        bytes memory ffiResult = vm.ffi(inputs);
+        (bytes memory exponent, bytes memory modulus, bytes memory emvFields, bytes memory rsaSignature) = 
+            abi.decode(ffiResult, (bytes, bytes, bytes, bytes));
+        
+        console.log("=== FFI Generated Data ===");
+        console.log("Exponent:", exponent.length, "bytes");
+        console.log("Modulus:", modulus.length, "bytes");
+        console.log("EMV Fields:", emvFields.length, "bytes");
+        console.log("Signature:", rsaSignature.length, "bytes");
+        
+        // STEP 2: Setup acquirer configuration
+        uint48 e2eAcquirerId = bytesToUint48(bytes6("E2EACQ"));
+        uint120 e2eMerchantId = bytesToUint120(bytes15("E2EMERCHANT001"));
+        uint64 e2eTerminalId = bytesToUint64(bytes8("E2ETERM1"));
+        
+        address e2eMerchant = makeAddr("e2eMerchant");
+        
+        acquirerConfig.setAcquirer(e2eAcquirerId, address(this));
+        acquirerConfig.setAcquirerFee(e2eAcquirerId, address(this), 25); // 0.25%
+        acquirerConfig.setSwipeFee(e2eAcquirerId, 50 * 10 ** 16); // $0.50
+        acquirerConfig.setMerchant(e2eAcquirerId, e2eMerchantId, e2eMerchant);
+        acquirerConfig.setTerminal(e2eAcquirerId, e2eTerminalId, address(this));
+        
+        console.log("=== Acquirer Configuration Complete ===");
+        
+        // STEP 3: Install EMVValidator with FFI-generated key
+        PackedUserOperation[] memory installValOps = new PackedUserOperation[](1);
+        installValOps[0] = _prepareUserOp(
+            VALIDATION_TYPE_ROOT,
+            false,
+            false,
+            abi.encodeWithSelector(
+                kernel.installModule.selector,
+                MODULE_TYPE_VALIDATOR,
+                address(emvValidator),
+                abi.encodePacked(
+                    address(0),
+                    abi.encode(
+                        abi.encode(uint16(0), exponent, modulus),
+                        hex"",
+                        abi.encodePacked(kernel.execute.selector)
+                    )
+                )
+            ),
+            true,
+            true,
+            false
+        );
+        
+        entrypoint.handleOps(installValOps, payable(address(0xdeadbeef)));
+        
+        // Verify EMVValidator was installed
+        assertTrue(
+            kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvValidator), ""),
+            "EMVValidator should be installed"
+        );
+        console.log("=== EMVValidator Installed ===");
+        
+        // STEP 4: Install EMVSettlement executor
+        PackedUserOperation[] memory installExecOps = new PackedUserOperation[](1);
+        installExecOps[0] = _prepareUserOp(
+            VALIDATION_TYPE_ROOT,
+            false,
+            false,
+            abi.encodeWithSelector(
+                kernel.installModule.selector,
+                MODULE_TYPE_EXECUTOR,
+                address(emvSettlement),
+                abi.encodePacked(
+                    address(0),
+                    abi.encode(
+                        abi.encode(address(mockERC20), address(acquirerConfig), uint8(18)),
+                        hex"",
+                        hex""
+                    )
+                )
+            ),
+            true,
+            true,
+            false
+        );
+        
+        entrypoint.handleOps(installExecOps, payable(address(0xdeadbeef)));
+        
+        // Verify EMVSettlement was installed
+        assertTrue(
+            kernel.isModuleInstalled(MODULE_TYPE_EXECUTOR, address(emvSettlement), ""),
+            "EMVSettlement should be installed"
+        );
+        console.log("=== EMVSettlement Installed ===");
+        
+        // STEP 5: Fund the kernel with tokens
+        uint256 transferAmount = 1e20; // 100 tokens ($100)
+        mockERC20.transfer(address(kernel), transferAmount * 2); // 2x for fees
+        vm.deal(address(kernel), 10 ether); // Ensure ETH for gas
+        
+        uint256 merchantBalanceBefore = mockERC20.balanceOf(e2eMerchant);
+        uint256 kernelBalanceBefore = mockERC20.balanceOf(address(kernel));
+        
+        console.log("=== Kernel Funded ===");
+        console.log("Kernel ERC20 balance:", kernelBalanceBefore);
+        
+        // STEP 6: Create UserOperation with EMV data in callData and RSA signature in signature
+        uint192 nonceKey = ValidatorLib.encodeAsNonceKey(
+            ValidationMode.unwrap(VALIDATION_MODE_DEFAULT),
+            ValidationType.unwrap(VALIDATION_TYPE_VALIDATOR),
+            bytes20(address(emvValidator)),
+            0
+        );
+        
+        bytes memory emvCallData = abi.encodeWithSelector(
+            kernel.execute.selector,
+            ExecLib.encode(CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, ExecModeSelector.wrap(0x00), ExecModePayload.wrap(0x00)),
+            abi.encodePacked(
+                address(emvSettlement),
+                abi.encodeWithSelector(emvSettlement.execute.selector, emvFields)
+            )
+        );
+        
+        PackedUserOperation[] memory emvOps = new PackedUserOperation[](1);
+        emvOps[0] = PackedUserOperation({
+            sender: address(kernel),
+            nonce: entrypoint.getNonce(address(kernel), nonceKey),
+            initCode: "",
+            callData: emvCallData,
+            accountGasLimits: bytes32(abi.encodePacked(uint128(2000000), uint128(2000000))),
+            preVerificationGas: 2000000,
+            gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
+            paymasterAndData: "",
+            signature: rsaSignature // FFI-generated RSA signature
+        });
+        
+        console.log("=== Executing EMV Transaction ===");
+        
+        // STEP 7: Execute transaction through entrypoint
+        entrypoint.handleOps(emvOps, payable(address(0xdeadbeef)));
+        
+        // STEP 8: Verify balances changed correctly
+        uint256 kernelBalanceAfter = mockERC20.balanceOf(address(kernel));
+        uint256 merchantBalanceAfter = mockERC20.balanceOf(e2eMerchant);
+        
+        console.log("=== Transaction Complete ===");
+        console.log("Kernel balance after:", kernelBalanceAfter);
+        console.log("Merchant balance after:", merchantBalanceAfter);
+        
+        // Merchant should have received tokens
+        assertGt(merchantBalanceAfter, merchantBalanceBefore, "Merchant should have received tokens");
+        
+        // Kernel should have spent tokens
+        assertLt(kernelBalanceAfter, kernelBalanceBefore, "Kernel should have spent tokens");
+        
+        // Calculate expected merchant amount (after fees: 2.40% + $0.50)
+        uint256 percentageFees = (transferAmount * 240) / 10000; // 2.40%
+        uint256 fixedFee = 50 * 10 ** 16; // $0.50
+        uint256 expectedMerchantAmount = transferAmount - percentageFees - fixedFee;
+        
+        uint256 merchantReceived = merchantBalanceAfter - merchantBalanceBefore;
+        assertEq(merchantReceived, expectedMerchantAmount, "Merchant should receive correct amount after fees");
+        
+        // STEP 9: Verify ATC was incremented
+        assertEq(emvValidator.getEMVStorage(address(kernel)), 1, "ATC should be incremented to 1");
+        
+        console.log("Complete end-to-end FFI EMV transaction successful!");
+        console.log("Merchant received:", merchantReceived / 1e18, "tokens");
+    }
+
+    function testFuzz_FFI_VerifyRandomSignatures(uint256 amountSeed, uint16 atcSeed) public {
+        // Simplified fuzz test: Just verify random signatures work cryptographically
+        // (Full E2E with kernel setup would be too slow for fuzzing)
+        
+        // Bound inputs
+        uint256 amountCents = bound(amountSeed, 10000, 500000); // $100-$5000
+        uint16 boundedAtc = uint16(bound(atcSeed, 0, 1000));
+        
+        // Generate unique IDs
+        string memory merchantId = string(abi.encodePacked("FUZZM", _uint256ToString(amountSeed % 100000)));
+        string memory terminalId = string(abi.encodePacked("FUZZT", _uint256ToString(atcSeed % 100)));
+        
+        merchantId = _truncateString(merchantId, 15);
+        terminalId = _truncateString(terminalId, 8);
+        
+        // Generate via FFI
+        string[] memory inputs = new string[](9);
+        inputs[0] = "node";
+        inputs[1] = "script/ffi-emv-test.js";
+        inputs[2] = _uint256ToString(amountCents);
+        inputs[3] = "840"; // Always USD
+        inputs[4] = _uint256ToString(boundedAtc);
+        inputs[5] = merchantId;
+        inputs[6] = terminalId;
+        inputs[7] = "FUZZAQ";
+        
+        bytes memory ffiResult = vm.ffi(inputs);
+        (bytes memory exponent, bytes memory modulus, bytes memory emvFields, bytes memory rsaSignature) = 
+            abi.decode(ffiResult, (bytes, bytes, bytes, bytes));
+        
+        // Validate sizes
+        assertEq(exponent.length, 3);
+        assertEq(modulus.length, 256);
+        assertEq(emvFields.length, 63);
+        assertEq(rsaSignature.length, 256);
+        
+        // Install and verify
+        EMVValidator fuzzValidator = new EMVValidator(address(emvSettlement), kernel.execute.selector);
+        fuzzValidator.onInstall(abi.encode(boundedAtc, exponent, modulus));
+        
+        bytes memory dynamicData = abi.encodePacked(bytes1(0x6A), bytes1(0x03), emvFields, bytes1(0xBC));
+        bytes32 dataHash = sha256(dynamicData);
+        
+        bool isValid = fuzzValidator.verifyEMVSignature(rsaSignature, dataHash, address(this));
+        assertTrue(isValid, "Fuzz signature should be valid");
+        
+        bytes4 erc1271 = fuzzValidator.isValidSignatureWithSender(address(this), dataHash, rsaSignature);
+        assertEq(erc1271, ERC1271_MAGICVALUE);
+    }
+
+    // Helper function to convert uint256 to string
+    function _uint256ToString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0";
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    // Helper function to truncate string to max length
+    function _truncateString(string memory str, uint256 maxLen) internal pure returns (string memory) {
+        bytes memory strBytes = bytes(str);
+        if (strBytes.length <= maxLen) {
+            return str;
+        }
+        bytes memory truncated = new bytes(maxLen);
+        for (uint256 i = 0; i < maxLen; i++) {
+            truncated[i] = strBytes[i];
+        }
+        return string(truncated);
+    }
+
+    // Helper to convert string to bytes6 (for acquirer ID)
+    function _stringToBytes6(string memory str) internal pure returns (bytes6) {
+        bytes memory strBytes = bytes(str);
+        bytes memory padded = new bytes(6);
+        uint256 len = strBytes.length < 6 ? strBytes.length : 6;
+        for (uint256 i = 0; i < len; i++) {
+            padded[i] = strBytes[i];
+        }
+        return bytes6(padded);
+    }
+
+    // Helper to convert string to bytes8 (for terminal ID)
+    function _stringToBytes8(string memory str) internal pure returns (bytes8) {
+        bytes memory strBytes = bytes(str);
+        bytes memory padded = new bytes(8);
+        uint256 len = strBytes.length < 8 ? strBytes.length : 8;
+        for (uint256 i = 0; i < len; i++) {
+            padded[i] = strBytes[i];
+        }
+        return bytes8(padded);
+    }
+
+    // Helper to convert string to bytes15 (for merchant ID)
+    function _stringToBytes15(string memory str) internal pure returns (bytes15) {
+        bytes memory strBytes = bytes(str);
+        bytes memory padded = new bytes(15);
+        uint256 len = strBytes.length < 15 ? strBytes.length : 15;
+        for (uint256 i = 0; i < len; i++) {
+            padded[i] = strBytes[i];
+        }
+        return bytes15(padded);
     }
 }
