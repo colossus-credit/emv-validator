@@ -171,9 +171,8 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops2, payable(address(0xdeadbeef)));
     }
 
-    function _createEMVTransactionData() internal pure returns (bytes memory) {
-        // Encode without padding to allow single-slice extraction
-        // New format: EMV fields (63 bytes) + RSA signature (256 bytes) = 319 bytes
+    function _createEMVFields() internal pure returns (bytes memory) {
+        // Create just the 63-byte EMV transaction fields
         return abi.encodePacked(
             TEST_ARQC, // 8 bytes
             TEST_UNPREDICTABLE_NUMBER, // 4 bytes
@@ -186,26 +185,23 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS, // 3 bytes
             TEST_TERMINAL_ID, // 8 bytes
             TEST_MERCHANT_ID, // 15 bytes
-            TEST_ACQUIRER_ID, // 6 bytes
-            TEST_SIGNATURE // 256 bytes (public key now registered, not in signature)
+            TEST_ACQUIRER_ID // 6 bytes
+        );
+    }
+
+    function _createEMVTransactionData() internal pure returns (bytes memory) {
+        // Legacy format for tests that need both fields and signature
+        // New format: EMV fields (63 bytes) + RSA signature (256 bytes) = 319 bytes
+        return abi.encodePacked(
+            _createEMVFields(),
+            TEST_SIGNATURE // 256 bytes
         );
     }
 
     function _createInvalidEMVTransactionData() internal pure returns (bytes memory) {
         // Encode without padding to allow single-slice extraction - with invalid signature length
         return abi.encodePacked(
-            TEST_ARQC, // 8 bytes
-            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
-            TEST_ATC, // 2 bytes
-            TEST_AMOUNT, // 6 bytes
-            TEST_CURRENCY, // 2 bytes
-            TEST_DATE, // 3 bytes
-            TEST_TXN_TYPE, // 1 byte
-            TEST_TVR, // 5 bytes
-            TEST_CVM_RESULTS, // 3 bytes
-            TEST_TERMINAL_ID, // 8 bytes
-            TEST_MERCHANT_ID, // 15 bytes
-            TEST_ACQUIRER_ID, // 6 bytes
+            _createEMVFields(),
             hex"deadbeef" // Invalid signature (4 bytes instead of 256) - will trigger InvalidRSAKeySize
         );
     }
@@ -239,16 +235,18 @@ contract EMVValidatorTest is KernelTestBase {
 
     function _encodeSimpleTransferCall() internal view returns (bytes memory) {
         // Call through Kernel's execute function using delegate call to EMVSettlement
+        // Now only passes EMV fields (63 bytes) to settlement, not the signature
         return abi.encodeWithSelector(
             kernel.execute.selector,
             ExecLib.encode(
                 CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, ExecModeSelector.wrap(0x00), ExecModePayload.wrap(0x00)
             ),
             abi.encodePacked(
-                address(emvSettlement), // delegate target
+                address(emvSettlement), // delegate target (20 bytes)
+                // For delegatecall: no value field, just target + calldata
                 abi.encodeWithSelector(
                     emvSettlement.execute.selector,
-                    _createEMVTransactionData() // EMVSettlement expects packed format
+                    _createEMVFields() // Now only EMV fields (63 bytes)
                 )
             )
         );
@@ -263,16 +261,24 @@ contract EMVValidatorTest is KernelTestBase {
             0 // parallel key
         );
 
+        // Prepare signature: valid RSA signature (256 bytes) or invalid short signature
+        bytes memory signature;
+        if (success) {
+            signature = TEST_SIGNATURE;
+        } else {
+            signature = hex"deadbeef";
+        }
+
         op = PackedUserOperation({
             sender: address(kernel),
             nonce: entrypoint.getNonce(address(kernel), nonceKey),
             initCode: "",
-            callData: callData,
+            callData: callData, // Contains EMV fields embedded in kernel.execute call
             accountGasLimits: bytes32(abi.encodePacked(uint128(1000000), uint128(1000000))),
             preVerificationGas: 1000000,
             gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
             paymasterAndData: "",
-            signature: success ? _createEMVTransactionData() : _createInvalidEMVTransactionData()
+            signature: signature // Just RSA signature (256 bytes) or invalid
         });
     }
 
@@ -1141,17 +1147,23 @@ contract EMVValidatorTest is KernelTestBase {
         // Install the validator with public key for this test contract
         emvValidator.onInstall(abi.encode(uint16(0), TEST_EXPONENT, TEST_MODULUS));
 
-        // Create signature data
-        bytes memory sigData = _createEMVTransactionData();
+        // Compute the hash of the EMV dynamic data
+        bytes32 dynamicDataHash = sha256(abi.encodePacked(
+            bytes1(0x6A), bytes1(0x03),
+            TEST_ARQC, TEST_UNPREDICTABLE_NUMBER, TEST_ATC, TEST_AMOUNT,
+            TEST_CURRENCY, TEST_DATE, TEST_TXN_TYPE, TEST_TVR, TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID, TEST_MERCHANT_ID, TEST_ACQUIRER_ID,
+            bytes1(0xBC)
+        ));
 
         // Test isValidSignatureWithSender - should return ERC1271_MAGICVALUE for valid signature
-        bytes32 testHash = keccak256("test");
-        bytes4 result = emvValidator.isValidSignatureWithSender(address(this), testHash, sigData);
+        // For ERC-1271, we only pass the RSA signature bytes (256 bytes), not the EMV fields
+        bytes4 result = emvValidator.isValidSignatureWithSender(address(this), dynamicDataHash, TEST_SIGNATURE);
         assertEq(result, ERC1271_MAGICVALUE);
 
-        // Test with invalid signature
-        bytes memory invalidSig = _createInvalidEMVTransactionData();
-        bytes4 invalidResult = emvValidator.isValidSignatureWithSender(address(this), testHash, invalidSig);
+        // Test with invalid signature (wrong hash)
+        bytes32 wrongHash = keccak256("wrong data");
+        bytes4 invalidResult = emvValidator.isValidSignatureWithSender(address(this), wrongHash, TEST_SIGNATURE);
         assertEq(invalidResult, ERC1271_INVALID);
     }
 
@@ -1427,17 +1439,6 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(feeRec.length, 1); // Only merchant when all fees are 0
     }
 
-    function test_PublicKeyNotRegistered() public {
-        // Create a new validator that has never been installed
-        EMVValidator testValidator = new EMVValidator(address(emvSettlement), kernel.execute.selector);
-        
-        // Try to verify signature without registering public key first
-        bytes memory sigData = _createEMVTransactionData();
-        
-        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
-        testValidator.verifyEMVSignature(sigData, address(this));
-    }
-
     function test_InvalidPublicKeySize_InvalidExponent() public {
         // Test with invalid exponent size (2 bytes instead of 3)
         bytes memory invalidExponent = hex"0100"; // 2 bytes
@@ -1485,13 +1486,11 @@ contract EMVValidatorTest is KernelTestBase {
         // Install validator first
         emvValidator.onInstall(abi.encode(uint16(0), TEST_EXPONENT, TEST_MODULUS));
         
-        // Create signature data
-        bytes memory sigData = _createEMVTransactionData();
         bytes32 testHash = keccak256("test");
         
         // Try to call isValidSignatureWithSender with address(0) as sender - should revert
         vm.expectRevert(EMVValidator.InvalidSender.selector);
-        emvValidator.isValidSignatureWithSender(address(0), testHash, sigData);
+        emvValidator.isValidSignatureWithSender(address(0), testHash, TEST_SIGNATURE);
     }
 
     function test_InvalidSender_WithInvalidSignature() public {
@@ -1506,5 +1505,55 @@ contract EMVValidatorTest is KernelTestBase {
         // Should revert with InvalidSender, NOT with signature validation errors
         vm.expectRevert(EMVValidator.InvalidSender.selector);
         emvValidator.isValidSignatureWithSender(address(0), testHash, invalidSigData);
+    }
+
+    function test_PublicKeyNotRegistered() public {
+        // Test that isValidSignatureWithSender reverts when public key is not registered
+        bytes32 testHash = keccak256("test");
+        address uninitializedAccount = makeAddr("uninitialized");
+        
+        // Try to validate signature for an account that never installed the validator
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.isValidSignatureWithSender(uninitializedAccount, testHash, TEST_SIGNATURE);
+    }
+
+    function test_InvalidRSAKeySize_WrongSignatureLength() public {
+        // Install validator first
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_EXPONENT, TEST_MODULUS));
+        
+        // Compute valid hash
+        bytes32 dynamicDataHash = sha256(abi.encodePacked(
+            bytes1(0x6A), bytes1(0x03),
+            TEST_ARQC, TEST_UNPREDICTABLE_NUMBER, TEST_ATC, TEST_AMOUNT,
+            TEST_CURRENCY, TEST_DATE, TEST_TXN_TYPE, TEST_TVR, TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID, TEST_MERCHANT_ID, TEST_ACQUIRER_ID,
+            bytes1(0xBC)
+        ));
+        
+        // Try with wrong signature length (128 bytes instead of 256)
+        bytes memory shortSignature = new bytes(128);
+        
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidRSAKeySize.selector, 128));
+        emvValidator.isValidSignatureWithSender(address(this), dynamicDataHash, shortSignature);
+    }
+
+    function test_InvalidRSAKeySize_EmptySignature() public {
+        // Install validator first
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_EXPONENT, TEST_MODULUS));
+        
+        // Compute valid hash
+        bytes32 dynamicDataHash = sha256(abi.encodePacked(
+            bytes1(0x6A), bytes1(0x03),
+            TEST_ARQC, TEST_UNPREDICTABLE_NUMBER, TEST_ATC, TEST_AMOUNT,
+            TEST_CURRENCY, TEST_DATE, TEST_TXN_TYPE, TEST_TVR, TEST_CVM_RESULTS,
+            TEST_TERMINAL_ID, TEST_MERCHANT_ID, TEST_ACQUIRER_ID,
+            bytes1(0xBC)
+        ));
+        
+        // Try with empty signature
+        bytes memory emptySignature = hex"";
+        
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidRSAKeySize.selector, 0));
+        emvValidator.isValidSignatureWithSender(address(this), dynamicDataHash, emptySignature);
     }
 }
