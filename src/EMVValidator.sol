@@ -30,9 +30,8 @@ struct EMVTransactionData {
     bytes terminalId; // 9F1C - Terminal ID (8 bytes)
     bytes merchantId; // 9F16 - Merchant ID (15 bytes)
     bytes acquirerId; // 9F01 - Acquirer ID (6 bytes)
-    bytes signature; // 9F4B - RSA signature
-    bytes exponent; // RSA public key exponent
-    bytes modulus; // RSA public key modulus
+    bytes signature; // 9F4B - RSA signature (256 bytes for RSA-2048)
+    // Note: Public key (exponent and modulus) are now registered during onInstall, not included in signature
 }
 
 /**
@@ -50,6 +49,8 @@ contract EMVValidator is IValidator {
     struct EMVValidatorStorage {
         mapping(uint32 => bool) usedUnpredictableNumbers; // Track used unpredictable numbers (4 bytes)
         uint16 expectedATC; // Next expected ATC value for this kernel instance
+        bytes exponent; // RSA public key exponent (3 bytes)
+        bytes modulus; // RSA public key modulus (256 bytes for RSA-2048)
     }
 
     mapping(address => EMVValidatorStorage) public emvValidatorStorage;
@@ -64,6 +65,9 @@ contract EMVValidator is IValidator {
     error InvalidTarget(address expected, address actual);
     error InvalidFunctionSelector(bytes4 expected, bytes4 actual);
     error InvalidRSAKeySize(uint256 actualSize);
+    error PublicKeyNotRegistered();
+    error InvalidPublicKeySize();
+    error InvalidSender();
 
     // ========== CONSTRUCTOR ==========
 
@@ -83,24 +87,44 @@ contract EMVValidator is IValidator {
     // ========== MODULE LIFECYCLE ==========
 
     /**
-     * @dev Install the module with ATC configuration
-     * @param _data Encoded configuration: abi.encode(atc)
+     * @dev Install the module with ATC configuration and public key registration
+     * @param _data Encoded configuration: abi.encode(atc, exponent, modulus)
+     *        - atc: uint16 - Initial ATC value
+     *        - exponent: bytes - RSA public key exponent (3 bytes)
+     *        - modulus: bytes - RSA public key modulus (256 bytes for RSA-2048)
      */
     function onInstall(bytes calldata _data) external payable override {
         if (_data.length == 0) {
             revert InvalidConfig();
         }
 
-        uint16 atc = abi.decode(_data, (uint16));
+        (uint16 atc, bytes memory exponent, bytes memory modulus) = abi.decode(_data, (uint16, bytes, bytes));
+        
+        // Validate RSA-2048 key size
+        if (exponent.length != 3) {
+            revert InvalidPublicKeySize();
+        }
+        if (modulus.length != 256) {
+            revert InvalidPublicKeySize();
+        }
+
         emvValidatorStorage[msg.sender].expectedATC = atc;
+        emvValidatorStorage[msg.sender].exponent = exponent;
+        emvValidatorStorage[msg.sender].modulus = modulus;
     }
 
     /**
      * @dev Uninstall the module
      */
     function onUninstall(bytes calldata) external payable override {
+        
         // Reset ATC counter for this account
         emvValidatorStorage[msg.sender].expectedATC = 0;
+        
+        // Clear registered public key
+        delete emvValidatorStorage[msg.sender].exponent;
+        delete emvValidatorStorage[msg.sender].modulus;
+        
         // Note: usedUnpredictableNumbers entries remain for security
     }
 
@@ -119,9 +143,8 @@ contract EMVValidator is IValidator {
     }
 
     function _isInitialized(address smartAccount) internal view returns (bool) {
-        // Module is considered initialized if the account has been configured
-        // Check if ATC has been set (non-zero) or if there are used unpredictable numbers
-        return emvValidatorStorage[smartAccount].expectedATC > 0;
+        // Module is considered initialized if the account has been configured with a public key
+        return emvValidatorStorage[smartAccount].modulus.length == 256;
     }
 
     // ========== VALIDATOR FUNCTIONS ==========
@@ -146,7 +169,7 @@ contract EMVValidator is IValidator {
         _validateCurrencyCode(userOp.signature);
 
         // Verify RSA signature using PKCS#1 v1.5 with SHA-256
-        bool isValid = _verifyEMVSignature(userOp.signature);
+        bool isValid = _verifyEMVSignature(userOp.signature, msg.sender);
 
         if (isValid) {
             // Validate replay protection and update state together (both work with same data)
@@ -159,17 +182,22 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Validate EMV signature for ERC-1271 (view-only, no state changes)
+     * @param sender The account address to validate signature for
      * @param hash The hash to validate
      * @param sig The signature data containing EMV transaction data
      * @return ERC1271_MAGICVALUE if valid, ERC1271_INVALID otherwise
      */
-    function isValidSignatureWithSender(address, bytes32 hash, bytes calldata sig)
+    function isValidSignatureWithSender(address sender, bytes32 hash, bytes calldata sig)
         external
         view
         override
         returns (bytes4)
     {
-        try this.verifyEMVSignature(sig) returns (bool success) {
+        if(sender == address(0)) {
+            revert InvalidSender();
+        }
+        
+        try this.verifyEMVSignature(sig, sender) returns (bool success) {
             if (success) {
                 return ERC1271_MAGICVALUE;
             }
@@ -180,8 +208,8 @@ contract EMVValidator is IValidator {
         return ERC1271_INVALID;
     }
 
-    function verifyEMVSignature(bytes calldata signature) external view returns (bool) {
-        return _verifyEMVSignature(signature);
+    function verifyEMVSignature(bytes calldata signature, address account) external view returns (bool) {
+        return _verifyEMVSignature(signature, account);
     }
 
     /**
@@ -200,6 +228,17 @@ contract EMVValidator is IValidator {
      */
     function getEMVStorage(address account) external view returns (uint16 expectedATC) {
         return emvValidatorStorage[account].expectedATC;
+    }
+
+    /**
+     * @dev Get the registered public key for a specific account
+     * @param account The smart account address
+     * @return exponent The RSA public key exponent
+     * @return modulus The RSA public key modulus
+     */
+    function getRegisteredPublicKey(address account) external view returns (bytes memory exponent, bytes memory modulus) {
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
+        return (accountStorage.exponent, accountStorage.modulus);
     }
 
     /**
@@ -345,46 +384,37 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Verify EMV RSA signature using PKCS#1 v1.5 with SHA-256
-     * @param signature The signature calldata containing all EMV transaction data
+     * @param signature The signature calldata containing EMV transaction data and RSA signature
+     * @param account The account address to validate signature for
      * @return true if signature is valid, false otherwise
      */
-    function _verifyEMVSignature(bytes calldata signature) internal view returns (bool) {
+    function _verifyEMVSignature(bytes calldata signature, address account) internal view returns (bool) {
+        // Get registered public key for this account
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
+        
+        // Ensure public key is registered
+        if (accountStorage.modulus.length != 256) {
+            revert PublicKeyNotRegistered();
+        }
+
         // Assemble dynamic data directly from calldata
         bytes memory dynamicData = _assembleDynamicData(signature);
 
-        // Extract signature and key components from packed data
+        // Extract signature from packed data
+        // New format: EMV fields (63 bytes) + RSA signature (256 bytes for RSA-2048)
         uint256 emvFieldsLength = 63; // All EMV fields
+        uint256 sigLength = 256; // RSA-2048 signature length
 
-        // Calculate modulus length first to determine signature length
-        // Total length - EMV fields - exponent(3) = signature + modulus
-        uint256 sigAndModulusLength = signature.length - emvFieldsLength - 3;
-
-        // For RSA-2048: signature(256) + modulus(256) = 512 bytes
-        // For RSA-1024: signature(128) + modulus(128) = 256 bytes
-        uint256 modulusLength;
-        uint256 sigLength;
-
-        if (sigAndModulusLength == 512) {
-            // RSA-2048
-            sigLength = 256;
-            modulusLength = 256;
-        } else if (sigAndModulusLength == 256) {
-            // RSA-1024 - block this
-            revert InvalidRSAKeySize(128);
-        } else {
-            // Invalid signature format
-            revert InvalidRSAKeySize(sigAndModulusLength / 2);
+        // Validate total signature length
+        if (signature.length != emvFieldsLength + sigLength) {
+            revert InvalidRSAKeySize(signature.length - emvFieldsLength);
         }
 
         bytes calldata sigBytes = signature[emvFieldsLength:emvFieldsLength + sigLength];
 
-        // Exponent starts after signature (always 3 bytes)
-        uint256 expStart = emvFieldsLength + sigLength;
-        bytes calldata exponent = signature[expStart:expStart + 3];
-
-        // Modulus starts after exponent
-        uint256 modStart = expStart + 3;
-        bytes calldata modulus = signature[modStart:modStart + modulusLength];
+        // Use registered public key
+        bytes memory exponent = accountStorage.exponent;
+        bytes memory modulus = accountStorage.modulus;
 
         // Verify RSA signature using PKCS#1 v1.5 with SHA-256
         return RsaVerifyOptimized.pkcs1Sha256Raw(dynamicData, sigBytes, exponent, modulus);
