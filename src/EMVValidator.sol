@@ -69,6 +69,8 @@ contract EMVValidator is IValidator {
     error InvalidPublicKeySize();
     error InvalidSender();
 
+    event EMVValidatorInstalled(address indexed account, uint16 atc, bytes exponent, bytes modulus);
+
     // ========== CONSTRUCTOR ==========
 
     /**
@@ -111,6 +113,8 @@ contract EMVValidator is IValidator {
         emvValidatorStorage[msg.sender].expectedATC = atc;
         emvValidatorStorage[msg.sender].exponent = exponent;
         emvValidatorStorage[msg.sender].modulus = modulus;
+
+        emit EMVValidatorInstalled(msg.sender, atc, exponent, modulus);
     }
 
     /**
