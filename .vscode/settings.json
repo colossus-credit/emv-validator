@@ -1,0 +1,12 @@
+{
+  "git.scanRepositories": [
+    "/Users/dangerousfood/Dev/kernel-emv/lib/kernel",
+    "/Users/dangerousfood/Dev/kernel-emv/lib/forge-std",
+  ],
+  "git.openRepositoryInParentFolders": "always",
+  "git.submodule.recurse": true,
+  "git.detectSubmodules": true,
+  "git.autoRepositoryDetection": "subFolders"
+}
+
+

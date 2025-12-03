@@ -30,9 +30,8 @@ struct EMVTransactionData {
     bytes terminalId; // 9F1C - Terminal ID (8 bytes)
     bytes merchantId; // 9F16 - Merchant ID (15 bytes)
     bytes acquirerId; // 9F01 - Acquirer ID (6 bytes)
-    bytes signature; // 9F4B - RSA signature
-    bytes exponent; // RSA public key exponent
-    bytes modulus; // RSA public key modulus
+    bytes signature; // 9F4B - RSA signature (256 bytes for RSA-2048)
+    // Note: Public key (exponent and modulus) are now registered during onInstall, not included in signature
 }
 
 /**
@@ -50,6 +49,8 @@ contract EMVValidator is IValidator {
     struct EMVValidatorStorage {
         mapping(uint32 => bool) usedUnpredictableNumbers; // Track used unpredictable numbers (4 bytes)
         uint16 expectedATC; // Next expected ATC value for this kernel instance
+        bytes exponent; // RSA public key exponent (3 bytes)
+        bytes modulus; // RSA public key modulus (256 bytes for RSA-2048)
     }
 
     mapping(address => EMVValidatorStorage) public emvValidatorStorage;
@@ -64,6 +65,9 @@ contract EMVValidator is IValidator {
     error InvalidTarget(address expected, address actual);
     error InvalidFunctionSelector(bytes4 expected, bytes4 actual);
     error InvalidRSAKeySize(uint256 actualSize);
+    error PublicKeyNotRegistered();
+    error InvalidPublicKeySize();
+    error InvalidSender();
 
     // ========== CONSTRUCTOR ==========
 
@@ -83,16 +87,30 @@ contract EMVValidator is IValidator {
     // ========== MODULE LIFECYCLE ==========
 
     /**
-     * @dev Install the module with ATC configuration
-     * @param _data Encoded configuration: abi.encode(atc)
+     * @dev Install the module with ATC configuration and public key registration
+     * @param _data Encoded configuration: abi.encode(atc, exponent, modulus)
+     *        - atc: uint16 - Initial ATC value
+     *        - exponent: bytes - RSA public key exponent (3 bytes)
+     *        - modulus: bytes - RSA public key modulus (256 bytes for RSA-2048)
      */
     function onInstall(bytes calldata _data) external payable override {
         if (_data.length == 0) {
             revert InvalidConfig();
         }
 
-        uint16 atc = abi.decode(_data, (uint16));
+        (uint16 atc, bytes memory exponent, bytes memory modulus) = abi.decode(_data, (uint16, bytes, bytes));
+
+        // Validate RSA-2048 key size
+        if (exponent.length != 3) {
+            revert InvalidPublicKeySize();
+        }
+        if (modulus.length != 256) {
+            revert InvalidPublicKeySize();
+        }
+
         emvValidatorStorage[msg.sender].expectedATC = atc;
+        emvValidatorStorage[msg.sender].exponent = exponent;
+        emvValidatorStorage[msg.sender].modulus = modulus;
     }
 
     /**
@@ -101,6 +119,11 @@ contract EMVValidator is IValidator {
     function onUninstall(bytes calldata) external payable override {
         // Reset ATC counter for this account
         emvValidatorStorage[msg.sender].expectedATC = 0;
+
+        // Clear registered public key
+        delete emvValidatorStorage[msg.sender].exponent;
+        delete emvValidatorStorage[msg.sender].modulus;
+
         // Note: usedUnpredictableNumbers entries remain for security
     }
 
@@ -119,69 +142,76 @@ contract EMVValidator is IValidator {
     }
 
     function _isInitialized(address smartAccount) internal view returns (bool) {
-        // Module is considered initialized if the account has been configured
-        // Check if ATC has been set (non-zero) or if there are used unpredictable numbers
-        return emvValidatorStorage[smartAccount].expectedATC > 0;
+        // Module is considered initialized if the account has been configured with a public key
+        return emvValidatorStorage[smartAccount].modulus.length == 256;
     }
 
     // ========== VALIDATOR FUNCTIONS ==========
 
     /**
      * @dev Validate EMV CDA signature for ERC-4337 user operation
-     * @param userOp The user operation containing EMV transaction data in signature field
-     * @param userOpHash The hash of the user operation
+     * @param userOp The user operation with EMV fields in callData and RSA signature in signature field
      * @return SIG_VALIDATION_SUCCESS_UINT if valid, SIG_VALIDATION_FAILED_UINT otherwise
+     * @notice The userOpHash parameter is unused as we use SHA-256 hash of the EMV dynamic data
      */
-    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
+    function validateUserOp(
+        PackedUserOperation calldata userOp,
+        bytes32 /* userOpHash */
+    )
         external
         payable
         override
         returns (uint256)
     {
+        // Note: userOp.callData should contain the kernel.execute() call with EMV fields
+        // We need to extract the EMV fields from within the execute call
+        bytes calldata emvFields = _extractEMVFieldsFromCallData(userOp.callData);
+
         // Validate that this EMV signature is being used for the correct target and function
         _validateTargetAndSelector(userOp.callData);
 
         // Gas-optimized validation using calldata extraction instead of full memory expansion
-        // Validate currency code
-        _validateCurrencyCode(userOp.signature);
+        // Validate currency code from EMV fields
+        _validateCurrencyCode(emvFields);
 
-        // Verify RSA signature using PKCS#1 v1.5 with SHA-256
-        bool isValid = _verifyEMVSignature(userOp.signature);
+        // Assemble dynamic data and compute its SHA-256 hash
+        bytes memory dynamicData = _assembleDynamicData(emvFields);
+        bytes32 dataHash = sha256(dynamicData);
 
-        if (isValid) {
-            // Validate replay protection and update state together (both work with same data)
-            _validateReplayProtectionAndUpdateState(userOp.signature);
-            return SIG_VALIDATION_SUCCESS_UINT;
-        } else {
-            return SIG_VALIDATION_FAILED_UINT;
-        }
+        // Validate replay protection and update state together (both work with same data)
+        _validateReplayProtectionAndUpdateState(emvFields);
+        // Verify RSA signature (userOp.signature should be 256 bytes)
+        return (_verifyEMVSignature(userOp.signature, dataHash, msg.sender))
+            ? SIG_VALIDATION_SUCCESS_UINT
+            : SIG_VALIDATION_FAILED_UINT;
     }
 
     /**
      * @dev Validate EMV signature for ERC-1271 (view-only, no state changes)
-     * @param hash The hash to validate
-     * @param sig The signature data containing EMV transaction data
+     * @param sender The account address to validate signature for
+     * @param hash The SHA-256 hash of the EMV dynamic data to validate
+     * @param sig The RSA signature bytes (256 bytes for RSA-2048)
      * @return ERC1271_MAGICVALUE if valid, ERC1271_INVALID otherwise
      */
-    function isValidSignatureWithSender(address, bytes32 hash, bytes calldata sig)
+    function isValidSignatureWithSender(address sender, bytes32 hash, bytes calldata sig)
         external
         view
         override
         returns (bytes4)
     {
-        try this.verifyEMVSignature(sig) returns (bool success) {
-            if (success) {
-                return ERC1271_MAGICVALUE;
-            }
-        } catch {
-            // Validation failed
+        if (sender == address(0)) {
+            revert InvalidSender();
         }
 
-        return ERC1271_INVALID;
+        if (!_isInitialized(sender)) {
+            revert PublicKeyNotRegistered();
+        }
+
+        return (_verifyEMVSignature(sig, hash, sender)) ? ERC1271_MAGICVALUE : ERC1271_INVALID;
     }
 
-    function verifyEMVSignature(bytes calldata signature) external view returns (bool) {
-        return _verifyEMVSignature(signature);
+    function verifyEMVSignature(bytes calldata signature, bytes32 hash, address account) external view returns (bool) {
+        return _verifyEMVSignature(signature, hash, account);
     }
 
     /**
@@ -203,6 +233,21 @@ contract EMVValidator is IValidator {
     }
 
     /**
+     * @dev Get the registered public key for a specific account
+     * @param account The smart account address
+     * @return exponent The RSA public key exponent
+     * @return modulus The RSA public key modulus
+     */
+    function getRegisteredPublicKey(address account)
+        external
+        view
+        returns (bytes memory exponent, bytes memory modulus)
+    {
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
+        return (accountStorage.exponent, accountStorage.modulus);
+    }
+
+    /**
      * @dev Check if an unpredictable number has been used for a specific account
      * @param account The smart account address
      * @param unpredictableNumber The unpredictable number to check
@@ -213,6 +258,33 @@ contract EMVValidator is IValidator {
     }
 
     // ========== INTERNAL VALIDATION FUNCTIONS ==========
+
+    /**
+     * @dev Extract EMV fields from the nested callData structure
+     * @param callData The callData from PackedUserOperation containing kernel.execute(...)
+     * @return emvFields The 63-byte EMV transaction fields
+     */
+    function _extractEMVFieldsFromCallData(bytes calldata callData) internal pure returns (bytes calldata emvFields) {
+        // Parse execute(ExecMode, bytes) call data structure:
+        // selector(4) + execMode(32) + offset(32) + length(32) + executionCalldata(variable)
+
+        // Get offset to executionCalldata (should be 0x40 = 64)
+        uint256 executionDataOffset = uint256(bytes32(callData[36:68]));
+
+        // ExecutionCalldata starts at: 4 + offset + 32 (skip length field)
+        uint256 executionDataStart = 4 + executionDataOffset + 32;
+
+        // For DELEGATECALL: decodeDelegate format (abi.encodePacked): target(20) + inner_calldata(variable)
+        // Skip target(20) bytes to get to inner calldata
+        uint256 innerCalldataStart = executionDataStart + 20;
+
+        // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields(63)
+        // Skip selector(4) + offset(32) + length(32) = 68 bytes
+        uint256 emvDataStart = innerCalldataStart + 68;
+
+        // EMV fields are always 63 bytes
+        return callData[emvDataStart:emvDataStart + 63];
+    }
 
     /**
      * @dev Validate that the callData is calling the expected target and function
@@ -248,39 +320,39 @@ contract EMVValidator is IValidator {
     // ========== GAS-OPTIMIZED CALLDATA EXTRACTION ==========
 
     /**
-     * @dev Extract unpredictable number (4 bytes) from packed signature - Assembly optimized
+     * @dev Extract unpredictable number (4 bytes) from packed EMV fields - Assembly optimized
      */
-    function _extractUnpredictableNumber(bytes calldata signature) internal pure returns (bytes4 result) {
+    function _extractUnpredictableNumber(bytes calldata emvFields) internal pure returns (bytes4 result) {
         assembly {
-            result := calldataload(add(signature.offset, 8))
+            result := calldataload(add(emvFields.offset, 8))
         }
     }
 
     /**
-     * @dev Extract ATC (2 bytes) from packed signature - Assembly optimized
+     * @dev Extract ATC (2 bytes) from packed EMV fields - Assembly optimized
      */
-    function _extractATC(bytes calldata signature) internal pure returns (bytes2 result) {
+    function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
         assembly {
-            result := calldataload(add(signature.offset, 12))
+            result := calldataload(add(emvFields.offset, 12))
         }
     }
 
     /**
-     * @dev Extract currency (2 bytes) from packed signature - Assembly optimized
+     * @dev Extract currency (2 bytes) from packed EMV fields - Assembly optimized
      */
-    function _extractCurrency(bytes calldata signature) internal pure returns (bytes2 result) {
+    function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
         assembly {
-            result := calldataload(add(signature.offset, 20))
+            result := calldataload(add(emvFields.offset, 20))
         }
     }
 
     /**
      * @dev Validate currency code (must be 840 USD or 997 USN)
-     * @param signature The signature calldata to extract currency from
+     * @param emvFields The EMV fields calldata to extract currency from
      */
-    function _validateCurrencyCode(bytes calldata signature) internal pure {
+    function _validateCurrencyCode(bytes calldata emvFields) internal pure {
         // Currency is stored as 2 bytes big-endian
-        bytes2 currencyBytes = _extractCurrency(signature);
+        bytes2 currencyBytes = _extractCurrency(emvFields);
         uint16 currency = uint16(currencyBytes);
         if (currency != 840 && currency != 997) {
             revert InvalidCurrencyCode(currency);
@@ -289,15 +361,15 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Validate replay protection and update transaction state in one operation - Storage optimized
-     * @param signature The signature calldata to extract data from
+     * @param emvFields The EMV fields calldata to extract data from
      */
-    function _validateReplayProtectionAndUpdateState(bytes calldata signature) internal {
+    function _validateReplayProtectionAndUpdateState(bytes calldata emvFields) internal {
         // Extract values using assembly for efficiency
         bytes4 unpredictableNumberBytes;
         bytes2 atcBytes;
         assembly {
-            unpredictableNumberBytes := calldataload(add(signature.offset, 8))
-            atcBytes := calldataload(add(signature.offset, 12))
+            unpredictableNumberBytes := calldataload(add(emvFields.offset, 8))
+            atcBytes := calldataload(add(emvFields.offset, 12))
         }
 
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
@@ -325,68 +397,44 @@ contract EMVValidator is IValidator {
     }
 
     /**
-     * @dev Assemble EMV dynamic data directly from calldata
-     * @param signature The signature calldata to extract fields from
+     * @dev Assemble EMV dynamic data directly from EMV fields
+     * @param emvFields The 63-byte EMV transaction fields
      * @return dynamicData The assembled dynamic data for signature verification
      */
-    function _assembleDynamicData(bytes calldata signature) internal pure returns (bytes memory dynamicData) {
-        // Extract all 12 EMV fields as one continuous slice from packed data
-        // Fields are now packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) + AcquirerId(6) = 63 bytes
-        bytes calldata allFieldBytes = signature[0:63]; // Extract first 63 bytes which contain all EMV fields
+    function _assembleDynamicData(bytes calldata emvFields) internal pure returns (bytes memory dynamicData) {
+        // EMV fields are packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) + AcquirerId(6) = 63 bytes
+        require(emvFields.length == 63, "Invalid EMV fields length");
 
         // Assemble according to EMV Book 2, Annex C.5 (Signed Data Format 3)
         return abi.encodePacked(
             bytes1(0x6A), // Header
             bytes1(0x03), // Format (Signed Data Format 3)
-            allFieldBytes, // All 12 fields as one slice (63 bytes)
+            emvFields, // All 12 fields as one slice (63 bytes)
             bytes1(0xBC) // Trailer
         );
     }
 
     /**
      * @dev Verify EMV RSA signature using PKCS#1 v1.5 with SHA-256
-     * @param signature The signature calldata containing all EMV transaction data
+     * @param signature The RSA signature bytes (must be 256 bytes for RSA-2048)
+     * @param hash The SHA-256 hash of the EMV dynamic data
+     * @param account The account address to validate signature for
      * @return true if signature is valid, false otherwise
      */
-    function _verifyEMVSignature(bytes calldata signature) internal view returns (bool) {
-        // Assemble dynamic data directly from calldata
-        bytes memory dynamicData = _assembleDynamicData(signature);
-
-        // Extract signature and key components from packed data
-        uint256 emvFieldsLength = 63; // All EMV fields
-
-        // Calculate modulus length first to determine signature length
-        // Total length - EMV fields - exponent(3) = signature + modulus
-        uint256 sigAndModulusLength = signature.length - emvFieldsLength - 3;
-
-        // For RSA-2048: signature(256) + modulus(256) = 512 bytes
-        // For RSA-1024: signature(128) + modulus(128) = 256 bytes
-        uint256 modulusLength;
-        uint256 sigLength;
-
-        if (sigAndModulusLength == 512) {
-            // RSA-2048
-            sigLength = 256;
-            modulusLength = 256;
-        } else if (sigAndModulusLength == 256) {
-            // RSA-1024 - block this
-            revert InvalidRSAKeySize(128);
-        } else {
-            // Invalid signature format
-            revert InvalidRSAKeySize(sigAndModulusLength / 2);
+    function _verifyEMVSignature(bytes calldata signature, bytes32 hash, address account) internal view returns (bool) {
+        // Use registered public key
+        bytes memory exponent = emvValidatorStorage[account].exponent;
+        bytes memory modulus = emvValidatorStorage[account].modulus;
+        // Validate public key size
+        if (exponent.length != 3 || modulus.length != 256) {
+            revert InvalidPublicKeySize();
+        }
+        // Validate signature length (must be 256 bytes for RSA-2048)
+        if (signature.length != 256) {
+            revert InvalidRSAKeySize(signature.length);
         }
 
-        bytes calldata sigBytes = signature[emvFieldsLength:emvFieldsLength + sigLength];
-
-        // Exponent starts after signature (always 3 bytes)
-        uint256 expStart = emvFieldsLength + sigLength;
-        bytes calldata exponent = signature[expStart:expStart + 3];
-
-        // Modulus starts after exponent
-        uint256 modStart = expStart + 3;
-        bytes calldata modulus = signature[modStart:modStart + modulusLength];
-
-        // Verify RSA signature using PKCS#1 v1.5 with SHA-256
-        return RsaVerifyOptimized.pkcs1Sha256Raw(dynamicData, sigBytes, exponent, modulus);
+        // Verify RSA signature using PKCS#1 v1.5 with pre-computed SHA-256 hash
+        return RsaVerifyOptimized.pkcs1Sha256(hash, signature, exponent, modulus);
     }
 }
