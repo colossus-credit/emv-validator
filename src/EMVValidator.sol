@@ -99,7 +99,7 @@ contract EMVValidator is IValidator {
         }
 
         (uint16 atc, bytes memory exponent, bytes memory modulus) = abi.decode(_data, (uint16, bytes, bytes));
-        
+
         // Validate RSA-2048 key size
         if (exponent.length != 3) {
             revert InvalidPublicKeySize();
@@ -117,14 +117,13 @@ contract EMVValidator is IValidator {
      * @dev Uninstall the module
      */
     function onUninstall(bytes calldata) external payable override {
-        
         // Reset ATC counter for this account
         emvValidatorStorage[msg.sender].expectedATC = 0;
-        
+
         // Clear registered public key
         delete emvValidatorStorage[msg.sender].exponent;
         delete emvValidatorStorage[msg.sender].modulus;
-        
+
         // Note: usedUnpredictableNumbers entries remain for security
     }
 
@@ -155,7 +154,10 @@ contract EMVValidator is IValidator {
      * @return SIG_VALIDATION_SUCCESS_UINT if valid, SIG_VALIDATION_FAILED_UINT otherwise
      * @notice The userOpHash parameter is unused as we use SHA-256 hash of the EMV dynamic data
      */
-    function validateUserOp(PackedUserOperation calldata userOp, bytes32 /* userOpHash */)
+    function validateUserOp(
+        PackedUserOperation calldata userOp,
+        bytes32 /* userOpHash */
+    )
         external
         payable
         override
@@ -179,7 +181,9 @@ contract EMVValidator is IValidator {
         // Validate replay protection and update state together (both work with same data)
         _validateReplayProtectionAndUpdateState(emvFields);
         // Verify RSA signature (userOp.signature should be 256 bytes)
-        return (_verifyEMVSignature(userOp.signature, dataHash, msg.sender)) ? SIG_VALIDATION_SUCCESS_UINT : SIG_VALIDATION_FAILED_UINT;
+        return (_verifyEMVSignature(userOp.signature, dataHash, msg.sender))
+            ? SIG_VALIDATION_SUCCESS_UINT
+            : SIG_VALIDATION_FAILED_UINT;
     }
 
     /**
@@ -195,11 +199,11 @@ contract EMVValidator is IValidator {
         override
         returns (bytes4)
     {
-        if(sender == address(0)) {
+        if (sender == address(0)) {
             revert InvalidSender();
         }
 
-        if(!_isInitialized(sender)) {
+        if (!_isInitialized(sender)) {
             revert PublicKeyNotRegistered();
         }
 
@@ -234,7 +238,11 @@ contract EMVValidator is IValidator {
      * @return exponent The RSA public key exponent
      * @return modulus The RSA public key modulus
      */
-    function getRegisteredPublicKey(address account) external view returns (bytes memory exponent, bytes memory modulus) {
+    function getRegisteredPublicKey(address account)
+        external
+        view
+        returns (bytes memory exponent, bytes memory modulus)
+    {
         EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
         return (accountStorage.exponent, accountStorage.modulus);
     }
@@ -262,18 +270,18 @@ contract EMVValidator is IValidator {
 
         // Get offset to executionCalldata (should be 0x40 = 64)
         uint256 executionDataOffset = uint256(bytes32(callData[36:68]));
-        
+
         // ExecutionCalldata starts at: 4 + offset + 32 (skip length field)
         uint256 executionDataStart = 4 + executionDataOffset + 32;
-        
+
         // For DELEGATECALL: decodeDelegate format (abi.encodePacked): target(20) + inner_calldata(variable)
         // Skip target(20) bytes to get to inner calldata
         uint256 innerCalldataStart = executionDataStart + 20;
-        
+
         // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields(63)
         // Skip selector(4) + offset(32) + length(32) = 68 bytes
         uint256 emvDataStart = innerCalldataStart + 68;
-        
+
         // EMV fields are always 63 bytes
         return callData[emvDataStart:emvDataStart + 63];
     }
@@ -421,7 +429,7 @@ contract EMVValidator is IValidator {
         if (exponent.length != 3 || modulus.length != 256) {
             revert InvalidPublicKeySize();
         }
-                // Validate signature length (must be 256 bytes for RSA-2048)
+        // Validate signature length (must be 256 bytes for RSA-2048)
         if (signature.length != 256) {
             revert InvalidRSAKeySize(signature.length);
         }
