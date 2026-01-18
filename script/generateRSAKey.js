@@ -47,14 +47,14 @@ function generateRSAKeyPair(outputPrefix = 'emv-key') {
     console.log(`✓ Private key saved to: ${privateKeyPath}`);
     console.log(`✓ Public key saved to: ${publicKeyPath}`);
     
-    // Extract modulus and exponent for contract
+    // Extract modulus and exponent for contract using JWK format (more reliable than DER parsing)
     const pubKeyObj = crypto.createPublicKey(publicKey);
-    const pubKeyDer = pubKeyObj.export({ type: 'spki', format: 'der' });
-    
-    // Extract modulus (last 256 bytes) and exponent
-    const modulusOffset = pubKeyDer.length - 256 - 5;
-    const modulus = pubKeyDer.slice(modulusOffset, modulusOffset + 256);
-    const exponent = Buffer.from([0x01, 0x00, 0x01]); // Standard exponent 65537
+    const jwk = pubKeyObj.export({ format: 'jwk' });
+
+    // JWK 'n' is the modulus in base64url encoding, 'e' is the exponent
+    // Convert from base64url to Buffer
+    const modulus = Buffer.from(jwk.n, 'base64url');
+    const exponent = Buffer.from(jwk.e, 'base64url');
     
     // Create contract data JSON
     const contractData = {
