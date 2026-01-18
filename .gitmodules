@@ -14,3 +14,6 @@
 	path = lib/kernel
 	url = https://github.com/colossus-credit/kernel.git
 	branch = dev
+[submodule "lib/openzeppelin-contracts"]
+	path = lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts.git

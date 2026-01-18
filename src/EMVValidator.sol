@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.26;
 
-import {RsaVerifyOptimized} from "lib/SolRsaVerify/src/RsaVerifyOptimized.sol";
+import {RSA} from "@openzeppelin/contracts/utils/cryptography/RSA.sol";
 import {IValidator, IExecutor, IHook} from "src/interfaces/IERC7579Modules.sol";
 import {PackedUserOperation} from "src/interfaces/PackedUserOperation.sol";
 import {
@@ -439,6 +439,6 @@ contract EMVValidator is IValidator {
         }
 
         // Verify RSA signature using PKCS#1 v1.5 with pre-computed SHA-256 hash
-        return RsaVerifyOptimized.pkcs1Sha256(hash, signature, exponent, modulus);
+        return RSA.pkcs1Sha256(hash, signature, exponent, modulus);
     }
 }
