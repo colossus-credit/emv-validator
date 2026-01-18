@@ -81,24 +81,16 @@ function signEMVData(emvFieldsHex, privateKeyPath) {
     console.log(`Signature Length: ${signature.length} bytes`);
     console.log(`Signature (hex): 0x${signature.toString('hex')}`);
     
-    // Extract public key info
+    // Extract public key info using JWK format (more reliable than DER parsing)
     const publicKey = crypto.createPublicKey(privateKey);
-    const publicKeyDetails = publicKey.export({ format: 'jwk' });
-    
+    const jwk = publicKey.export({ format: 'jwk' });
+
     console.log(`\n=== Public Key Info ===`);
-    console.log(`Key Size: ${publicKeyDetails.n ? Buffer.from(publicKeyDetails.n, 'base64').length * 8 : 'unknown'} bits`);
-    
-    // Export public key in format needed for contract
-    const publicKeyDer = publicKey.export({ type: 'spki', format: 'der' });
-    
-    // Extract modulus and exponent from DER format
-    // For RSA, the structure in SPKI format has modulus and exponent at specific offsets
-    // This is a simplified extraction - for production, use a proper ASN.1 parser
-    const modulusOffset = publicKeyDer.length - 256 - 5; // Approximate offset for RSA-2048
-    const modulus = publicKeyDer.slice(modulusOffset, modulusOffset + 256);
-    
-    // Exponent is typically 0x010001 (65537) for RSA
-    const exponent = Buffer.from([0x01, 0x00, 0x01]);
+    console.log(`Key Size: ${jwk.n ? Buffer.from(jwk.n, 'base64url').length * 8 : 'unknown'} bits`);
+
+    // JWK 'n' is the modulus in base64url encoding, 'e' is the exponent
+    const modulus = Buffer.from(jwk.n, 'base64url');
+    const exponent = Buffer.from(jwk.e, 'base64url');
     
     console.log(`Exponent (3 bytes): 0x${exponent.toString('hex')}`);
     console.log(`Modulus (256 bytes): 0x${modulus.toString('hex')}`);

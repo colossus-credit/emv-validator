@@ -7,4 +7,7 @@ optimizer_runs = 200
 via_ir = true
 ffi = true
 
+[lint]
+lint_on_build = false
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
