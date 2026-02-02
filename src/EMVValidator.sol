@@ -414,11 +414,11 @@ contract EMVValidator is IValidator {
      *   Bytes 223-254: Outer Hash = SHA-256(bytes[1..223] || UN(9F37))
      *   Byte 255:     0xBC (trailer)
      */
-    function _verifyEMVSignature(
-        bytes calldata signature,
-        bytes calldata emvFields,
-        address account
-    ) internal view returns (bool) {
+    function _verifyEMVSignature(bytes calldata signature, bytes calldata emvFields, address account)
+        internal
+        view
+        returns (bool)
+    {
         // Use registered public key
         bytes memory exponent = emvValidatorStorage[account].exponent;
         bytes memory modulus = emvValidatorStorage[account].modulus;
@@ -446,8 +446,8 @@ contract EMVValidator is IValidator {
         // Step 4: Check B == 0x6A (header)
         if (decrypted[0] != 0x6A) return false;
         // Additional Format 05 structure checks
-        if (decrypted[1] != 0x05) return false;    // format
-        if (decrypted[2] != 0x02) return false;    // hash algo SHA-256
+        if (decrypted[1] != 0x05) return false; // format
+        if (decrypted[2] != 0x02) return false; // hash algo SHA-256
         // Step 5: Check E == 0xBC (trailer)
         if (decrypted[255] != 0xBC) return false;
 
@@ -485,11 +485,11 @@ contract EMVValidator is IValidator {
      * @param modulus The RSA modulus
      * @return result The decrypted plaintext (same length as modulus)
      */
-    function _rsaDecrypt(
-        bytes calldata sig,
-        bytes memory exponent,
-        bytes memory modulus
-    ) internal view returns (bytes memory result) {
+    function _rsaDecrypt(bytes calldata sig, bytes memory exponent, bytes memory modulus)
+        internal
+        view
+        returns (bytes memory result)
+    {
         // modexp precompile input format:
         // [32 bytes: base length] [32 bytes: exp length] [32 bytes: mod length] [base] [exp] [mod]
         uint256 baseLen = sig.length;
@@ -528,16 +528,7 @@ contract EMVValidator is IValidator {
             }
 
             // Call modexp precompile (0x05)
-            if iszero(
-                staticcall(
-                    not(0),
-                    0x05,
-                    input,
-                    inputLen,
-                    add(result, 0x20),
-                    modLen
-                )
-            ) {
+            if iszero(staticcall(not(0), 0x05, input, inputLen, add(result, 0x20), modLen)) {
                 revert(0, 0)
             }
         }
