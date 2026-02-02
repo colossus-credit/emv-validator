@@ -126,7 +126,10 @@ function generateEMVData(options = {}) {
         unpredictableNumber: crypto.randomBytes(4), // Random 4-byte number
         atc: Buffer.from([(atc >> 8) & 0xFF, atc & 0xFF]), // 2-byte ATC (big-endian)
         amount: amountToBCD(amount), // 6-byte BCD amount
-        currency: Buffer.from([(currency >> 8) & 0xFF, currency & 0xFF]), // 2-byte currency (big-endian)
+        currency: (() => { // 2-byte BCD currency (EMV tag 5F2A, format n3 = 4 BCD digits)
+            const s = currency.toString().padStart(4, '0');
+            return Buffer.from([parseInt(s[0], 10) * 16 + parseInt(s[1], 10), parseInt(s[2], 10) * 16 + parseInt(s[3], 10)]);
+        })(),
         date: dateToBCD(date), // 3-byte BCD date
         txnType: Buffer.from([txnType]), // 1-byte transaction type
         tvr: Buffer.alloc(5), // 5-byte TVR (all zeros for simplicity)

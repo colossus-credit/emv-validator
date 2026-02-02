@@ -2,7 +2,6 @@
 
 pragma solidity ^0.8.26;
 
-import {RSA} from "@openzeppelin/contracts/utils/cryptography/RSA.sol";
 import {IValidator, IExecutor, IHook} from "src/interfaces/IERC7579Modules.sol";
 import {PackedUserOperation} from "src/interfaces/PackedUserOperation.sol";
 import {
@@ -178,14 +177,11 @@ contract EMVValidator is IValidator {
         // Validate currency code from EMV fields
         _validateCurrencyCode(emvFields);
 
-        // Assemble dynamic data and compute its SHA-256 hash
-        bytes memory dynamicData = _assembleDynamicData(emvFields);
-        bytes32 dataHash = sha256(dynamicData);
-
         // Validate replay protection and update state together (both work with same data)
         _validateReplayProtectionAndUpdateState(emvFields);
-        // Verify RSA signature (userOp.signature should be 256 bytes)
-        return (_verifyEMVSignature(userOp.signature, dataHash, msg.sender))
+        // Verify RSA signature using CDA Format 05 (EMV Book 2, Section 6.6.2, Table 22)
+        // Uses raw RSA (ISO 9796-2 padding scheme, not PKCS#1 v1.5)
+        return (_verifyEMVSignature(userOp.signature, emvFields, msg.sender))
             ? SIG_VALIDATION_SUCCESS_UINT
             : SIG_VALIDATION_FAILED_UINT;
     }
@@ -211,11 +207,7 @@ contract EMVValidator is IValidator {
             revert PublicKeyNotRegistered();
         }
 
-        return (_verifyEMVSignature(sig, hash, sender)) ? ERC1271_MAGICVALUE : ERC1271_INVALID;
-    }
-
-    function verifyEMVSignature(bytes calldata signature, bytes32 hash, address account) external view returns (bool) {
-        return _verifyEMVSignature(signature, hash, account);
+        return _verifyRSAHash(sig, hash, sender) ? ERC1271_MAGICVALUE : ERC1271_INVALID;
     }
 
     /**
@@ -355,11 +347,11 @@ contract EMVValidator is IValidator {
      * @param emvFields The EMV fields calldata to extract currency from
      */
     function _validateCurrencyCode(bytes calldata emvFields) internal pure {
-        // Currency is stored as 2 bytes big-endian
+        // Currency is BCD-encoded per EMV spec (tag 5F2A, format n3)
+        // USD = 0x0840 (BCD for 840), USN = 0x0997 (BCD for 997)
         bytes2 currencyBytes = _extractCurrency(emvFields);
-        uint16 currency = uint16(currencyBytes);
-        if (currency != 840 && currency != 997) {
-            revert InvalidCurrencyCode(currency);
+        if (currencyBytes != bytes2(0x0840) && currencyBytes != bytes2(0x0997)) {
+            revert InvalidCurrencyCode(uint16(currencyBytes));
         }
     }
 
@@ -388,44 +380,45 @@ contract EMVValidator is IValidator {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
-        if (receivedATC != currentATC) {
+        if (receivedATC < currentATC) {
             revert InvalidATCSequence(currentATC, receivedATC);
         }
 
         // Update state after validation passes (batch storage writes)
         accountStorage.usedUnpredictableNumbers[unpredictableNumber] = true;
-        accountStorage.expectedATC = currentATC + 1;
+        accountStorage.expectedATC = receivedATC + 1;
 
         // Emit combined event
-        emit ReplayProtectionUpdated(msg.sender, unpredictableNumberBytes, currentATC + 1);
+        emit ReplayProtectionUpdated(msg.sender, unpredictableNumberBytes, receivedATC + 1);
     }
 
     /**
-     * @dev Assemble EMV dynamic data directly from EMV fields
-     * @param emvFields The 63-byte EMV transaction fields
-     * @return dynamicData The assembled dynamic data for signature verification
-     */
-    function _assembleDynamicData(bytes calldata emvFields) internal pure returns (bytes memory dynamicData) {
-        // EMV fields are packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) + AcquirerId(6) = 63 bytes
-        require(emvFields.length == 63, "Invalid EMV fields length");
-
-        // Assemble according to EMV Book 2, Annex C.5 (Signed Data Format 3)
-        return abi.encodePacked(
-            bytes1(0x6A), // Header
-            bytes1(0x03), // Format (Signed Data Format 3)
-            emvFields, // All 12 fields as one slice (63 bytes)
-            bytes1(0xBC) // Trailer
-        );
-    }
-
-    /**
-     * @dev Verify EMV RSA signature using PKCS#1 v1.5 with SHA-256
+     * @dev Verify EMV CDA Format 05 RSA signature per EMV Book 2 v4.3, Section 6.6.2, Table 22
+     *      Uses ISO 9796-2 Scheme 1 padding (0x6A header, 0xBB fill, 0xBC trailer)
      * @param signature The RSA signature bytes (must be 256 bytes for RSA-2048)
-     * @param hash The SHA-256 hash of the EMV dynamic data
+     * @param emvFields The 63-byte EMV transaction fields (to extract ARQC and UN for verification)
      * @param account The account address to validate signature for
      * @return true if signature is valid, false otherwise
+     *
+     * Format 05 signed block (256 bytes):
+     *   Byte 0:       0x6A (header)
+     *   Byte 1:       0x05 (format)
+     *   Byte 2:       0x02 (hash algo = SHA-256)
+     *   Byte 3:       0x32 (ICC dynamic data length = 50)
+     *   Byte 4:       0x08 (dynamic number length)
+     *   Bytes 5-12:   ICC Dynamic Number (9F4C, 8 bytes)
+     *   Byte 13:      CID (9F27, 1 byte)
+     *   Bytes 14-21:  AC/ARQC (9F26, 8 bytes)
+     *   Bytes 22-53:  Transaction Data Hash (SHA-256, 32 bytes)
+     *   Bytes 54-222: 0xBB padding (169 bytes)
+     *   Bytes 223-254: Outer Hash = SHA-256(bytes[1..223] || UN(9F37))
+     *   Byte 255:     0xBC (trailer)
      */
-    function _verifyEMVSignature(bytes calldata signature, bytes32 hash, address account) internal view returns (bool) {
+    function _verifyEMVSignature(
+        bytes calldata signature,
+        bytes calldata emvFields,
+        address account
+    ) internal view returns (bool) {
         // Use registered public key
         bytes memory exponent = emvValidatorStorage[account].exponent;
         bytes memory modulus = emvValidatorStorage[account].modulus;
@@ -438,7 +431,141 @@ contract EMVValidator is IValidator {
             revert InvalidRSAKeySize(signature.length);
         }
 
-        // Verify RSA signature using PKCS#1 v1.5 with pre-computed SHA-256 hash
-        return RSA.pkcs1Sha256(hash, signature, exponent, modulus);
+        // Signature verification per EMV Book 2 v4.3, Annex A2.1.3:
+        //   1. Check signature is N bytes (256 for RSA-2048) — done above
+        //   2. RSA decrypt: X = Recover(PK)[S]
+        //   3. Partition X = (B || MSG1 || H || E)
+        //      B = byte 0, MSG1 = bytes 1..222, H = bytes 223..254, E = byte 255
+        //   4. Check B == 0x6A
+        //   5. Check E == 0xBC
+        //   6. Check H == Hash(MSG1 || MSG2), where MSG2 = Unpredictable Number
+
+        // Step 2: RSA decrypt using modexp precompile (raw RSA, no PKCS#1 padding)
+        bytes memory decrypted = _rsaDecrypt(signature, exponent, modulus);
+
+        // Step 4: Check B == 0x6A (header)
+        if (decrypted[0] != 0x6A) return false;
+        // Additional Format 05 structure checks
+        if (decrypted[1] != 0x05) return false;    // format
+        if (decrypted[2] != 0x02) return false;    // hash algo SHA-256
+        // Step 5: Check E == 0xBC (trailer)
+        if (decrypted[255] != 0xBC) return false;
+
+        // Verify ARQC in signed block (bytes 14-21) matches emvFields (bytes 0-7)
+        for (uint256 i = 0; i < 8; i++) {
+            if (decrypted[14 + i] != emvFields[i]) return false;
+        }
+
+        // Step 6: Check H == Hash(MSG1 || MSG2)
+        //   MSG1 = decrypted[1..222] (222 bytes)
+        //   MSG2 = Unpredictable Number from emvFields[8:12] (4 bytes)
+        //   H    = decrypted[223..254] (32 bytes, SHA-256)
+        bytes memory outerHashInput = new bytes(222 + 4);
+        for (uint256 i = 0; i < 222; i++) {
+            outerHashInput[i] = decrypted[1 + i];
+        }
+        for (uint256 i = 0; i < 4; i++) {
+            outerHashInput[222 + i] = emvFields[8 + i];
+        }
+        bytes32 computedOuterHash = sha256(outerHashInput);
+
+        bytes32 blockOuterHash;
+        assembly {
+            blockOuterHash := mload(add(add(decrypted, 0x20), 223))
+        }
+
+        return computedOuterHash == blockOuterHash;
+    }
+
+    /**
+     * @dev RSA decrypt using modexp precompile (address 0x05)
+     * Performs raw RSA: result = signature^exponent mod modulus
+     * @param sig The RSA signature (ciphertext)
+     * @param exponent The RSA public exponent
+     * @param modulus The RSA modulus
+     * @return result The decrypted plaintext (same length as modulus)
+     */
+    function _rsaDecrypt(
+        bytes calldata sig,
+        bytes memory exponent,
+        bytes memory modulus
+    ) internal view returns (bytes memory result) {
+        // modexp precompile input format:
+        // [32 bytes: base length] [32 bytes: exp length] [32 bytes: mod length] [base] [exp] [mod]
+        uint256 baseLen = sig.length;
+        uint256 expLen = exponent.length;
+        uint256 modLen = modulus.length;
+        uint256 inputLen = 96 + baseLen + expLen + modLen;
+
+        result = new bytes(modLen);
+
+        assembly {
+            // Allocate input in scratch memory (after free memory pointer)
+            let input := mload(0x40)
+            // Update free memory pointer
+            mstore(0x40, add(input, inputLen))
+
+            // Write lengths
+            mstore(input, baseLen)
+            mstore(add(input, 0x20), expLen)
+            mstore(add(input, 0x40), modLen)
+
+            // Copy sig (base) from calldata
+            calldatacopy(add(input, 0x60), sig.offset, baseLen)
+
+            // Copy exponent from memory (skip length prefix)
+            let eSrc := add(exponent, 0x20)
+            let eDst := add(add(input, 0x60), baseLen)
+            for { let i := 0 } lt(i, expLen) { i := add(i, 0x20) } {
+                mstore(add(eDst, i), mload(add(eSrc, i)))
+            }
+
+            // Copy modulus from memory (skip length prefix)
+            let mSrc := add(modulus, 0x20)
+            let mDst := add(eDst, expLen)
+            for { let i := 0 } lt(i, modLen) { i := add(i, 0x20) } {
+                mstore(add(mDst, i), mload(add(mSrc, i)))
+            }
+
+            // Call modexp precompile (0x05)
+            if iszero(
+                staticcall(
+                    not(0),
+                    0x05,
+                    input,
+                    inputLen,
+                    add(result, 0x20),
+                    modLen
+                )
+            ) {
+                revert(0, 0)
+            }
+        }
+    }
+
+    /**
+     * @dev Verify RSA signature against a SHA-256 hash (for ERC-1271)
+     * RSA-decrypts the signature and compares sha256(decrypted) to the provided hash
+     * @param signature The RSA signature (256 bytes)
+     * @param hash The expected SHA-256 hash of the decrypted block
+     * @param account The account whose public key to use
+     * @return true if sha256(RSA_decrypt(signature)) == hash
+     */
+    function _verifyRSAHash(bytes calldata signature, bytes32 hash, address account) internal view returns (bool) {
+        bytes memory exponent = emvValidatorStorage[account].exponent;
+        bytes memory modulus = emvValidatorStorage[account].modulus;
+        if (exponent.length != 3 || modulus.length != 256) {
+            revert InvalidPublicKeySize();
+        }
+        if (signature.length != 256) {
+            revert InvalidRSAKeySize(signature.length);
+        }
+
+        bytes memory decrypted = _rsaDecrypt(signature, exponent, modulus);
+        return sha256(decrypted) == hash;
+    }
+
+    function verifyEMVSignature(bytes calldata signature, bytes32 hash, address account) external view returns (bool) {
+        return _verifyRSAHash(signature, hash, account);
     }
 }
