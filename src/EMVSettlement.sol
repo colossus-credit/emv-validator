@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.23;
 
 import {AcquirerConfig} from "./AcquirerConfig.sol";
-import {MODULE_TYPE_EXECUTOR} from "src/types/Constants.sol";
+import {MODULE_TYPE_EXECUTOR} from "kernel/src/types/Constants.sol";
 import {EMVTransactionData} from "./EMVValidator.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
