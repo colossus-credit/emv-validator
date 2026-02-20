@@ -107,18 +107,20 @@ contract EMVSettlement is Ownable {
      * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
      */
     function execute(bytes calldata emvData) external payable {
-        // Extract only the fields we need directly from packed data
-        // Amount is at offset 14: ARQC(8) + UnpredictableNumber(4) + ATC(2) = 14
-        bytes calldata amountBytes = emvData[14:20]; // 6 bytes for amount
+        // Extract fields from 40-byte packed data:
+        // ICC_DN(3) + Amount(6) + UN(4) + TerminalID(8) + MerchantID(15) + ATC(2) + Currency(2) = 40 bytes
 
-        // TerminalId is at offset 34: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) = 34
-        uint64 terminalId = uint64(bytes8(emvData[34:42])); // 8 bytes for terminalId converted to uint64
+        // Amount is at offset 3: ICC_DN(3) = 3
+        bytes calldata amountBytes = emvData[3:9]; // 6 bytes for amount
 
-        // MerchantId is at offset 42: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) = 42
-        uint120 merchantId = uint120(bytes15(emvData[42:57])); // 15 bytes for merchantId converted to uint120
+        // TerminalId is at offset 13: ICC_DN(3) + Amount(6) + UN(4) = 13
+        uint64 terminalId = uint64(bytes8(emvData[13:21])); // 8 bytes for terminalId converted to uint64
 
-        // AcquirerId is at offset 57: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57
-        uint48 acquirerId = uint48(bytes6(emvData[57:63])); // 6 bytes for acquirerId converted to uint48
+        // MerchantId is at offset 21: ICC_DN(3) + Amount(6) + UN(4) + TerminalID(8) = 21
+        uint120 merchantId = uint120(bytes15(emvData[21:36])); // 15 bytes for merchantId converted to uint120
+
+        // AcquirerId - hardcoded for now (not in 40-byte format)
+        uint48 acquirerId = 0x414351554952; // "ACQUIR" in hex (6 bytes)
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
