@@ -107,20 +107,15 @@ contract EMVSettlement is Ownable {
      * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
      */
     function execute(bytes calldata emvData) external payable {
-        // Extract fields from 40-byte packed data:
-        // ICC_DN(3) + Amount(6) + UN(4) + TerminalID(8) + MerchantID(15) + ATC(2) + Currency(2) = 40 bytes
+        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset) =
+            _emvSettlementOffsets(emvData);
 
-        // Amount is at offset 3: ICC_DN(3) = 3
-        bytes calldata amountBytes = emvData[3:9]; // 6 bytes for amount
-
-        // TerminalId is at offset 13: ICC_DN(3) + Amount(6) + UN(4) = 13
-        uint64 terminalId = uint64(bytes8(emvData[13:21])); // 8 bytes for terminalId converted to uint64
-
-        // MerchantId is at offset 21: ICC_DN(3) + Amount(6) + UN(4) + TerminalID(8) = 21
-        uint120 merchantId = uint120(bytes15(emvData[21:36])); // 15 bytes for merchantId converted to uint120
-
-        // AcquirerId - hardcoded for now (not in 40-byte format)
-        uint48 acquirerId = 0x414351554952; // "ACQUIR" in hex (6 bytes)
+        bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
+        uint64 terminalId = uint64(bytes8(emvData[terminalOffset:terminalOffset + 8]));
+        uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
+        uint48 acquirerId = acquirerOffset == 0
+            ? uint48(0x414351554952)  // "ACQUIR" in compact 40-byte payloads.
+            : uint48(bytes6(emvData[acquirerOffset:acquirerOffset + 6]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -154,6 +149,22 @@ contract EMVSettlement is Ownable {
     }
 
     // ========== INTERNAL FUNCTIONS ==========
+
+    function _emvSettlementOffsets(bytes calldata emvData)
+        internal
+        pure
+        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset)
+    {
+        if (emvData.length == 40) {
+            return (3, 13, 21, 0);
+        }
+
+        if (emvData.length == 63) {
+            return (14, 34, 42, 57);
+        }
+
+        revert InvalidBCDLength();
+    }
 
     /**
      * @dev Process payments to fee recipients including fees and merchant remainder

@@ -6,8 +6,11 @@ import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
-import {P256Verifier} from "../src/P256VerifierCompat.sol";
 import "forge-std/console.sol";
+
+interface IP256VerifierCodeDeployer {
+    function deployRuntimeCode() external returns (bytes memory);
+}
 
 contract EMVValidatorTest is KernelTestBase {
     EMVValidator public emvValidator;
@@ -61,16 +64,16 @@ contract EMVValidatorTest is KernelTestBase {
 
     // Valid P-256 ECDSA signature (r||s, 64 bytes)
     // Signed data: SHA-256(UN || Amount || Currency || ATC) = SHA-256(1234567800000001000008400000)
-    bytes constant TEST_SIGNATURE =
-        hex"9bbbe1037a8906e7324a5bc583b51f109779afd8ae5c6739ecd6d82e66b48ae4"  // r
+    bytes constant TEST_SIGNATURE = hex"9bbbe1037a8906e7324a5bc583b51f109779afd8ae5c6739ecd6d82e66b48ae4" // r
         hex"068dd48c7554807e9be40a39e08717f28a1f98def1a534fd7ca1de1699aae415"; // s
 
     function setUp() public override {
         super.setUp(); // Initialize KernelTestBase
 
-        // Deploy P256Verifier at expected address for P256.sol library
-        P256Verifier verifier = new P256Verifier();
-        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, address(verifier).code);
+        address p256VerifierCodeDeployer =
+            deployCode("test/utils/P256VerifierCodeDeployer.sol:P256VerifierCodeDeployer");
+        bytes memory p256VerifierCode = IP256VerifierCodeDeployer(p256VerifierCodeDeployer).deployRuntimeCode();
+        vm.etch(address(0x100), p256VerifierCode);
 
         // Deploy EMV components
         acquirerConfig = new AcquirerConfig();
@@ -1132,10 +1135,10 @@ contract EMVValidatorTest is KernelTestBase {
         // Compute hash of the signed data (not the full dynamic data)
         bytes32 signedDataHash = sha256(
             abi.encodePacked(
-                TEST_UNPREDICTABLE_NUMBER,  // 4 bytes
-                TEST_AMOUNT,                 // 6 bytes
-                TEST_CURRENCY,               // 2 bytes
-                TEST_ATC                     // 2 bytes
+                TEST_UNPREDICTABLE_NUMBER, // 4 bytes
+                TEST_AMOUNT, // 6 bytes
+                TEST_CURRENCY, // 2 bytes
+                TEST_ATC // 2 bytes
             )
         );
 
@@ -1169,8 +1172,7 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,
             TEST_TERMINAL_ID,
             TEST_MERCHANT_ID,
-            TEST_ACQUIRER_ID,
-            TEST_SIGNATURE // P-256 signature only (64 bytes)
+            TEST_ACQUIRER_ID
         );
 
         // Direct call to settlement should revert
@@ -1420,7 +1422,6 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(feeRec.length, 1); // Only merchant when all fees are 0
     }
 
-
     function test_GetRegisteredPublicKey() public whenInitialized {
         _installEMVValidator();
 
@@ -1542,35 +1543,30 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(result, ERC1271_INVALID, "Should return INVALID for empty signature");
     }
 
-    // ========== FFI TESTS ==========
+    // ========== P-256 END-TO-END TESTS ==========
 
     function test_FFI_CompleteEndToEndTransaction() public whenInitialized {
-        // Complete end-to-end test: Generate key, install modules, fund, sign, and execute transaction
-        // This uses a specific amount to avoid fuzz complexity
-
         // Ensure kernel has ETH for gas
         vm.deal(address(kernel), 10 ether);
 
-        // STEP 1: Generate RSA key, EMV data, and signature via FFI
-        string[] memory inputs = new string[](9);
-        inputs[0] = "node";
-        inputs[1] = "script/ffi-emv-test.js";
-        inputs[2] = "10000"; // $100.00 in cents
-        inputs[3] = "840"; // USD
-        inputs[4] = "0"; // ATC = 0
-        inputs[5] = "E2EMERCHANT001"; // Merchant ID
-        inputs[6] = "E2ETERM1"; // Terminal ID
-        inputs[7] = "E2EACQ"; // Acquirer ID
+        bytes memory emvFields = abi.encodePacked(
+            TEST_ARQC,
+            TEST_UNPREDICTABLE_NUMBER,
+            TEST_ATC,
+            TEST_AMOUNT,
+            TEST_CURRENCY,
+            TEST_DATE,
+            TEST_TXN_TYPE,
+            TEST_TVR,
+            TEST_CVM_RESULTS,
+            bytes8("E2ETERM1"),
+            bytes15("E2EMERCHANT001"),
+            bytes6("E2EACQ")
+        );
 
-        bytes memory ffiResult = vm.ffi(inputs);
-        (bytes memory exponent, bytes memory modulus, bytes memory emvFields, bytes memory rsaSignature) =
-            abi.decode(ffiResult, (bytes, bytes, bytes, bytes));
-
-        console.log("=== FFI Generated Data ===");
-        console.log("Exponent:", exponent.length, "bytes");
-        console.log("Modulus:", modulus.length, "bytes");
+        console.log("=== P-256 Fixture Data ===");
         console.log("EMV Fields:", emvFields.length, "bytes");
-        console.log("Signature:", rsaSignature.length, "bytes");
+        console.log("Signature:", TEST_SIGNATURE.length, "bytes");
 
         // STEP 2: Setup acquirer configuration
         uint48 e2eAcquirerId = bytesToUint48(bytes6("E2EACQ"));
@@ -1587,7 +1583,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         console.log("=== Acquirer Configuration Complete ===");
 
-        // STEP 3: Install EMVValidator with FFI-generated key
+        // STEP 3: Install EMVValidator with P-256 public key
         PackedUserOperation[] memory installValOps = new PackedUserOperation[](1);
         installValOps[0] = _prepareUserOp(
             VALIDATION_TYPE_ROOT,
@@ -1600,7 +1596,9 @@ contract EMVValidatorTest is KernelTestBase {
                 abi.encodePacked(
                     address(0),
                     abi.encode(
-                        abi.encode(uint16(0), exponent, modulus), hex"", abi.encodePacked(kernel.execute.selector)
+                        abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y),
+                        hex"",
+                        abi.encodePacked(kernel.execute.selector)
                     )
                 )
             ),
@@ -1658,7 +1656,7 @@ contract EMVValidatorTest is KernelTestBase {
         console.log("=== Kernel Funded ===");
         console.log("Kernel ERC20 balance:", kernelBalanceBefore);
 
-        // STEP 6: Create UserOperation with EMV data in callData and RSA signature in signature
+        // STEP 6: Create UserOperation with EMV data in callData and P-256 signature in signature
         uint192 nonceKey = ValidatorLib.encodeAsNonceKey(
             ValidationMode.unwrap(VALIDATION_MODE_DEFAULT),
             ValidationType.unwrap(VALIDATION_TYPE_VALIDATOR),
@@ -1684,7 +1682,7 @@ contract EMVValidatorTest is KernelTestBase {
             preVerificationGas: 2000000,
             gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
             paymasterAndData: "",
-            signature: rsaSignature // FFI-generated RSA signature
+            signature: TEST_SIGNATURE
         });
 
         console.log("=== Executing EMV Transaction ===");
@@ -1720,7 +1718,6 @@ contract EMVValidatorTest is KernelTestBase {
         console.log("Complete end-to-end FFI EMV transaction successful!");
         console.log("Merchant received:", merchantReceived / 1e18, "tokens");
     }
-
 
     // Helper function to convert uint256 to string
     function _uint256ToString(uint256 value) internal pure returns (string memory) {

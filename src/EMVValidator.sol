@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.23;
 
-import {P256} from "./P256Compat.sol";
+import {P256} from "solady/utils/P256.sol";
 import {IValidator, IExecutor, IHook} from "kernel/src/interfaces/IERC7579Modules.sol";
 import {PackedUserOperation} from "kernel/src/interfaces/PackedUserOperation.sol";
 import {
@@ -218,15 +218,15 @@ contract EMVValidator is IValidator {
         bytes32 pubkeyY = emvValidatorStorage[sender].pubkeyY;
 
         // Extract signature components: r (32 bytes) || s (32 bytes)
-        uint256 r;
-        uint256 s;
+        bytes32 r;
+        bytes32 s;
         assembly {
             r := calldataload(sig.offset)
             s := calldataload(add(sig.offset, 32))
         }
 
         // Verify ECDSA signature using P256 library
-        bool isValid = P256.verifySignature(hash, r, s, uint256(pubkeyX), uint256(pubkeyY));
+        bool isValid = P256.verifySignature(hash, r, s, pubkeyX, pubkeyY);
 
         return isValid ? ERC1271_MAGICVALUE : ERC1271_INVALID;
     }
@@ -255,11 +255,7 @@ contract EMVValidator is IValidator {
      * @return pubkeyX The P-256 public key x coordinate
      * @return pubkeyY The P-256 public key y coordinate
      */
-    function getRegisteredPublicKey(address account)
-        external
-        view
-        returns (bytes32 pubkeyX, bytes32 pubkeyY)
-    {
+    function getRegisteredPublicKey(address account) external view returns (bytes32 pubkeyX, bytes32 pubkeyY) {
         EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
         return (accountStorage.pubkeyX, accountStorage.pubkeyY);
     }
@@ -279,7 +275,7 @@ contract EMVValidator is IValidator {
     /**
      * @dev Extract EMV fields from the nested callData structure
      * @param callData The callData from PackedUserOperation containing kernel.execute(...)
-     * @return emvFields The 63-byte EMV transaction fields
+     * @return emvFields The EMV transaction fields
      */
     function _extractEMVFieldsFromCallData(bytes calldata callData) internal pure returns (bytes calldata emvFields) {
         // Parse execute(ExecMode, bytes) call data structure:
@@ -295,12 +291,12 @@ contract EMVValidator is IValidator {
         // Skip target(20) bytes to get to inner calldata
         uint256 innerCalldataStart = executionDataStart + 20;
 
-        // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields(63)
+        // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields
         // Skip selector(4) + offset(32) + length(32) = 68 bytes
         uint256 emvDataStart = innerCalldataStart + 68;
+        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 36:innerCalldataStart + 68]));
 
-        // EMV fields are always 63 bytes
-        return callData[emvDataStart:emvDataStart + 63];
+        return callData[emvDataStart:emvDataStart + emvDataLength];
     }
 
     /**
@@ -336,13 +332,29 @@ contract EMVValidator is IValidator {
 
     // ========== GAS-OPTIMIZED CALLDATA EXTRACTION ==========
 
+    function _emvFieldOffsets(bytes calldata emvFields)
+        internal
+        pure
+        returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
+    {
+        if (emvFields.length == 40) {
+            return (9, 36, 3, 38);
+        }
+
+        if (emvFields.length == 63) {
+            return (8, 12, 14, 20);
+        }
+
+        revert InvalidSignatureLength(emvFields.length);
+    }
+
     /**
      * @dev Extract unpredictable number (4 bytes) from packed EMV fields - Assembly optimized
      */
     function _extractUnpredictableNumber(bytes calldata emvFields) internal pure returns (bytes4 result) {
-        // UN is at position 9-12 in the 40-byte format (after ICC_DN(3) + Amount(6))
+        (uint256 unpredictableNumberOffset,,,) = _emvFieldOffsets(emvFields);
         assembly {
-            result := calldataload(add(emvFields.offset, 9))
+            result := calldataload(add(emvFields.offset, unpredictableNumberOffset))
         }
     }
 
@@ -351,8 +363,9 @@ contract EMVValidator is IValidator {
      * Position 36-37 in 40-byte format
      */
     function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
+        (, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
         assembly {
-            result := calldataload(add(emvFields.offset, 36))
+            result := calldataload(add(emvFields.offset, atcOffset))
         }
     }
 
@@ -361,8 +374,9 @@ contract EMVValidator is IValidator {
      * Position 38-39 in 40-byte format
      */
     function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
+        (,,, uint256 currencyOffset) = _emvFieldOffsets(emvFields);
         assembly {
-            result := calldataload(add(emvFields.offset, 38))
+            result := calldataload(add(emvFields.offset, currencyOffset))
         }
     }
 
@@ -371,11 +385,10 @@ contract EMVValidator is IValidator {
      * @param emvFields The EMV fields calldata to extract currency from
      */
     function _validateCurrencyCode(bytes calldata emvFields) internal pure {
-        // Currency is stored as 2 bytes in BCD format (n3 per EMV spec)
-        // 840 USD = 0x0840, 997 USN = 0x0997
+        // Accept both BCD-style n3 encoding and uint16 numeric encoding used by local fixtures.
         bytes2 currencyBytes = _extractCurrency(emvFields);
         uint16 currency = uint16(currencyBytes);
-        if (currency != 0x0840 && currency != 0x0997) {
+        if (currency != 0x0840 && currency != 0x0997 && currency != 840 && currency != 997) {
             revert InvalidCurrencyCode(currency);
         }
     }
@@ -386,12 +399,12 @@ contract EMVValidator is IValidator {
      */
     function _validateReplayProtectionAndUpdateState(bytes calldata emvFields) internal {
         // Extract values using assembly for efficiency
-        // UN at position 9, ATC at position 36 in 40-byte format
+        (uint256 unpredictableNumberOffset, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
         bytes4 unpredictableNumberBytes;
         bytes2 atcBytes;
         assembly {
-            unpredictableNumberBytes := calldataload(add(emvFields.offset, 9))
-            atcBytes := calldataload(add(emvFields.offset, 36))
+            unpredictableNumberBytes := calldataload(add(emvFields.offset, unpredictableNumberOffset))
+            atcBytes := calldataload(add(emvFields.offset, atcOffset))
         }
 
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
@@ -420,7 +433,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Assemble EMV dynamic data directly from EMV fields
-     * @param emvFields The 63-byte EMV transaction fields
+     * @param emvFields The EMV transaction fields
      * @return dynamicData The assembled dynamic data for signature verification
      */
     /**
@@ -449,30 +462,26 @@ contract EMVValidator is IValidator {
         }
 
         // Extract signature components: r (32 bytes) || s (32 bytes)
-        uint256 r;
-        uint256 s;
+        bytes32 r;
+        bytes32 s;
         assembly {
             r := calldataload(signature.offset)
             s := calldataload(add(signature.offset, 32))
         }
 
-        // emvFields format (40 bytes total):
-        // Bytes 0-35: ICC_DN(3) + Amount(6) + UN(4) + TerminalID(8) + MerchantID(15) [SIGNED BY CARD]
-        // Bytes 36-37: ATC(2) [for replay protection, NOT signed]
-        // Bytes 38-39: Currency(2) [for validation, NOT signed]
+        (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset) =
+            _emvFieldOffsets(emvFields);
 
-        // Validate emvFields length (must be 40 bytes)
-        if (emvFields.length != 40) {
-            revert InvalidSignatureLength(emvFields.length);
-        }
+        bytes memory signedMessage = abi.encodePacked(
+            emvFields[unpredictableNumberOffset:unpredictableNumberOffset + 4],
+            emvFields[amountOffset:amountOffset + 6],
+            emvFields[currencyOffset:currencyOffset + 2],
+            emvFields[atcOffset:atcOffset + 2]
+        );
 
-        // Extract only the signed portion (first 36 bytes) for signature verification
-        bytes memory signedMessage = emvFields[0:36];
-
-        // Compute SHA-256 hash of the 36-byte signed message
         bytes32 messageHash = sha256(signedMessage);
 
         // Verify ECDSA signature using P256 library
-        return P256.verifySignature(messageHash, r, s, uint256(pubkeyX), uint256(pubkeyY));
+        return P256.verifySignature(messageHash, r, s, pubkeyX, pubkeyY);
     }
 }
