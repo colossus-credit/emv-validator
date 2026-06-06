@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.23;
 
 import {AcquirerConfig} from "./AcquirerConfig.sol";
-import {MODULE_TYPE_EXECUTOR} from "src/types/Constants.sol";
+import {MODULE_TYPE_EXECUTOR} from "kernel/src/types/Constants.sol";
 import {EMVTransactionData} from "./EMVValidator.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
@@ -107,18 +107,15 @@ contract EMVSettlement is Ownable {
      * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
      */
     function execute(bytes calldata emvData) external payable {
-        // Extract only the fields we need directly from packed data
-        // Amount is at offset 14: ARQC(8) + UnpredictableNumber(4) + ATC(2) = 14
-        bytes calldata amountBytes = emvData[14:20]; // 6 bytes for amount
+        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset) =
+            _emvSettlementOffsets(emvData);
 
-        // TerminalId is at offset 34: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) = 34
-        uint64 terminalId = uint64(bytes8(emvData[34:42])); // 8 bytes for terminalId converted to uint64
-
-        // MerchantId is at offset 42: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) = 42
-        uint120 merchantId = uint120(bytes15(emvData[42:57])); // 15 bytes for merchantId converted to uint120
-
-        // AcquirerId is at offset 57: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57
-        uint48 acquirerId = uint48(bytes6(emvData[57:63])); // 6 bytes for acquirerId converted to uint48
+        bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
+        uint64 terminalId = uint64(bytes8(emvData[terminalOffset:terminalOffset + 8]));
+        uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
+        uint48 acquirerId = acquirerOffset == 0
+            ? uint48(0x414351554952)  // "ACQUIR" in compact 40-byte payloads.
+            : uint48(bytes6(emvData[acquirerOffset:acquirerOffset + 6]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -152,6 +149,22 @@ contract EMVSettlement is Ownable {
     }
 
     // ========== INTERNAL FUNCTIONS ==========
+
+    function _emvSettlementOffsets(bytes calldata emvData)
+        internal
+        pure
+        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset)
+    {
+        if (emvData.length == 40) {
+            return (3, 13, 21, 0);
+        }
+
+        if (emvData.length == 63) {
+            return (14, 34, 42, 57);
+        }
+
+        revert InvalidBCDLength();
+    }
 
     /**
      * @dev Process payments to fee recipients including fees and merchant remainder
@@ -217,7 +230,7 @@ contract EMVSettlement is Ownable {
         // Convert from cents to token units using provided decimals
         // EMV amounts are typically in cents (2 decimal places)
         // So we need to convert: cents -> token units
-        // Example: If token has 18 decimals, multiply by 10^(18-2) = 10^16
+        // Example: If token has 6 decimals, multiply by 10^(6-2) = 10^4
         return amount * 10 ** (tokenDecimals - 2);
     }
 }

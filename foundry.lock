@@ -11,6 +11,9 @@
       "rev": "e2041f376c970fd451a8ad8177268f106a7faca2"
     }
   },
+  "lib/openzeppelin-contracts": {
+    "rev": "69c8def5f222ff96f2b5beff05dfba996368aa79"
+  },
   "lib/solady": {
     "tag": {
       "name": "v0.1.26",
