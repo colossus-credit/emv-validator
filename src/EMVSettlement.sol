@@ -230,7 +230,7 @@ contract EMVSettlement is Ownable {
         // Convert from cents to token units using provided decimals
         // EMV amounts are typically in cents (2 decimal places)
         // So we need to convert: cents -> token units
-        // Example: If token has 18 decimals, multiply by 10^(18-2) = 10^16
+        // Example: If token has 6 decimals, multiply by 10^(6-2) = 10^4
         return amount * 10 ** (tokenDecimals - 2);
     }
 }

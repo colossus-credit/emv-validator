@@ -19,7 +19,8 @@ contract DeployBaseSepolia is Script {
     {
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
-        uint256 tokenDecimals = vm.envOr("TOKEN_DECIMALS", uint256(18));
+        // Base Sepolia deployments default the local test token to 6 decimals unless overridden.
+        uint256 tokenDecimals = vm.envOr("TOKEN_DECIMALS", uint256(6));
         uint256 initialTokenSupply = vm.envOr("INITIAL_TOKEN_SUPPLY", uint256(0));
 
         if (tokenDecimals > type(uint8).max) {

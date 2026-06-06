@@ -42,7 +42,7 @@ jobs:
           : "${BASE_SEPOLIA_RPC_URL:?Missing BASE_SEPOLIA_RPC_URL secret}"
           : "${DEPLOYER_PRIVATE_KEY:?Missing DEPLOYER_PRIVATE_KEY secret}"
           : "${BASESCAN_API_KEY:?Missing BASESCAN_API_KEY secret}"
-          export TOKEN_DECIMALS="${TOKEN_DECIMALS:-18}"
+          export TOKEN_DECIMALS="${TOKEN_DECIMALS:-6}"
           export INITIAL_TOKEN_SUPPLY="${INITIAL_TOKEN_SUPPLY:-0}"
 
           forge script script/DeployBaseSepolia.s.sol:DeployBaseSepolia \
