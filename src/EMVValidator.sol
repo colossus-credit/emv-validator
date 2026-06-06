@@ -31,8 +31,7 @@ struct EMVTransactionData {
     bytes terminalId; // 9F1C - Terminal ID (8 bytes)
     bytes merchantId; // 9F16 - Merchant ID (15 bytes)
     bytes acquirerId; // 9F01 - Acquirer ID (6 bytes)
-    bytes signature; // ECDSA signature: 64 bytes raw r||s (from DER-decoded 9F4B)
-    // Note: P-256 public key (x, y coordinates) registered during onInstall, not included per-transaction
+    bytes signature; // P-256 signature envelope: keyHash || pubkeyX || pubkeyY || r || s
 }
 
 /**
@@ -43,15 +42,20 @@ struct EMVTransactionData {
 contract EMVValidator is IValidator {
     // ========== EVENTS ==========
 
-    event ReplayProtectionUpdated(address indexed kernel, bytes4 unpredictableNumber, uint16 newATC);
+    event ReplayProtectionUpdated(
+        address indexed kernel, bytes32 indexed keyHash, bytes4 unpredictableNumber, uint256 newATC
+    );
 
     // ========== STORAGE ==========
 
+    uint256 private constant KEY_INITIALIZED = 1 << 255;
+    uint256 private constant ATC_MASK = KEY_INITIALIZED - 1;
+    uint256 private constant ATC_MAX = type(uint16).max;
+
     struct EMVValidatorStorage {
+        bool initialized;
         mapping(uint32 => bool) usedUnpredictableNumbers; // Track used unpredictable numbers (4 bytes)
-        uint16 expectedATC; // Next expected ATC value for this kernel instance
-        bytes32 pubkeyX; // P-256 public key x coordinate (32 bytes)
-        bytes32 pubkeyY; // P-256 public key y coordinate (32 bytes)
+        mapping(bytes32 keyHash => uint256 atcState) keyATCState;
     }
 
     mapping(address => EMVValidatorStorage) public emvValidatorStorage;
@@ -68,6 +72,8 @@ contract EMVValidator is IValidator {
     error InvalidSignatureLength(uint256 actualSize);
     error PublicKeyNotRegistered();
     error InvalidPublicKeySize();
+    error InvalidPublicKey();
+    error ATCExhausted(bytes32 keyHash);
     error InvalidSender();
     error InvalidSignature();
 
@@ -109,9 +115,11 @@ contract EMVValidator is IValidator {
             revert InvalidPublicKeySize();
         }
 
-        emvValidatorStorage[msg.sender].expectedATC = atc;
-        emvValidatorStorage[msg.sender].pubkeyX = pubkeyX;
-        emvValidatorStorage[msg.sender].pubkeyY = pubkeyY;
+        bytes32 keyHash = computeKeyHash(pubkeyX, pubkeyY);
+
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
+        accountStorage.initialized = true;
+        accountStorage.keyATCState[keyHash] = KEY_INITIALIZED | uint256(atc);
 
         emit EMVValidatorInstalled(msg.sender, atc, pubkeyX, pubkeyY);
     }
@@ -120,14 +128,8 @@ contract EMVValidator is IValidator {
      * @dev Uninstall the module
      */
     function onUninstall(bytes calldata) external payable override {
-        // Reset ATC counter for this account
-        emvValidatorStorage[msg.sender].expectedATC = 0;
-
-        // Clear registered P-256 public key
-        delete emvValidatorStorage[msg.sender].pubkeyX;
-        delete emvValidatorStorage[msg.sender].pubkeyY;
-
-        // Note: usedUnpredictableNumbers entries remain for security
+        emvValidatorStorage[msg.sender].initialized = false;
+        // Note: key ATC state and used unpredictable numbers remain for security and cannot be enumerated.
     }
 
     /**
@@ -145,16 +147,14 @@ contract EMVValidator is IValidator {
     }
 
     function _isInitialized(address smartAccount) internal view returns (bool) {
-        // Module is considered initialized if the account has been configured with a P-256 public key
-        return emvValidatorStorage[smartAccount].pubkeyX != bytes32(0)
-            && emvValidatorStorage[smartAccount].pubkeyY != bytes32(0);
+        return emvValidatorStorage[smartAccount].initialized;
     }
 
     // ========== VALIDATOR FUNCTIONS ==========
 
     /**
      * @dev Validate EMV CDA signature for ERC-4337 user operation
-     * @param userOp The user operation with EMV fields in callData and RSA signature in signature field
+     * @param userOp The user operation with EMV fields in callData and P-256 signature envelope in signature field
      * @return SIG_VALIDATION_SUCCESS_UINT if valid, SIG_VALIDATION_FAILED_UINT otherwise
      * @notice The userOpHash parameter is unused as we use SHA-256 hash of the EMV dynamic data
      */
@@ -178,20 +178,28 @@ contract EMVValidator is IValidator {
         // Validate currency code from EMV fields
         _validateCurrencyCode(emvFields);
 
-        // Validate replay protection and update state
-        _validateReplayProtectionAndUpdateState(emvFields);
+        (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s) =
+            _decodeEMVSignature(userOp.signature);
+        if (!_isValidPublicKeyHash(keyHash, pubkeyX, pubkeyY)) {
+            revert InvalidPublicKey();
+        }
 
-        // Verify P-256 ECDSA signature (userOp.signature should be 64 bytes: r||s)
-        return (_verifyEMVSignature(userOp.signature, emvFields, msg.sender))
-            ? SIG_VALIDATION_SUCCESS_UINT
-            : SIG_VALIDATION_FAILED_UINT;
+        (bytes4 unpredictableNumber, uint256 currentATC) = _validateReplayProtection(emvFields, msg.sender, keyHash);
+
+        if (!_verifyEMVSignature(emvFields, pubkeyX, pubkeyY, r, s)) {
+            return SIG_VALIDATION_FAILED_UINT;
+        }
+
+        _updateReplayProtectionAndATC(keyHash, unpredictableNumber, currentATC);
+
+        return SIG_VALIDATION_SUCCESS_UINT;
     }
 
     /**
      * @dev Validate EMV signature for ERC-1271 (view-only, no state changes)
      * @param sender The account address to validate signature for
      * @param hash The SHA-256 hash of the EMV dynamic data to validate
-     * @param sig The ECDSA P-256 signature bytes (64 bytes: r||s)
+     * @param sig The P-256 signature envelope: keyHash || pubkeyX || pubkeyY || r || s
      * @return ERC1271_MAGICVALUE if valid, ERC1271_INVALID otherwise
      */
     function isValidSignatureWithSender(address sender, bytes32 hash, bytes calldata sig)
@@ -208,21 +216,18 @@ contract EMVValidator is IValidator {
             revert PublicKeyNotRegistered();
         }
 
-        // Validate signature length (must be 64 bytes: r||s)
-        if (sig.length != 64) {
+        if (sig.length != 160) {
             return ERC1271_INVALID;
         }
 
-        // Get registered P-256 public key
-        bytes32 pubkeyX = emvValidatorStorage[sender].pubkeyX;
-        bytes32 pubkeyY = emvValidatorStorage[sender].pubkeyY;
+        (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s) = _decodeEMVSignature(sig);
 
-        // Extract signature components: r (32 bytes) || s (32 bytes)
-        bytes32 r;
-        bytes32 s;
-        assembly {
-            r := calldataload(sig.offset)
-            s := calldataload(add(sig.offset, 32))
+        if (!_isValidPublicKeyHash(keyHash, pubkeyX, pubkeyY)) {
+            return ERC1271_INVALID;
+        }
+
+        if (!_isPublicKeyRegistered(sender, keyHash)) {
+            revert PublicKeyNotRegistered();
         }
 
         // Verify ECDSA signature using P256 library
@@ -240,24 +245,37 @@ contract EMVValidator is IValidator {
         return (target, selector);
     }
 
-    /**
-     * @dev Get the EMV storage for a specific account
-     * @param account The smart account address
-     * @return expectedATC The next expected ATC value
-     */
-    function getEMVStorage(address account) external view returns (uint16 expectedATC) {
-        return emvValidatorStorage[account].expectedATC;
+    function computeKeyHash(bytes32 pubkeyX, bytes32 pubkeyY) public pure returns (bytes32) {
+        return keccak256(abi.encode(pubkeyX, pubkeyY));
     }
 
     /**
-     * @dev Get the registered public key for a specific account
+     * @dev Get the per-key ATC state for a specific account.
      * @param account The smart account address
-     * @return pubkeyX The P-256 public key x coordinate
-     * @return pubkeyY The P-256 public key y coordinate
+     * @param keyHash The hash of abi.encode(pubkeyX, pubkeyY)
+     * @return expectedATC The next expected ATC value
+     * @return initialized True if the key has been installed for the account
      */
-    function getRegisteredPublicKey(address account) external view returns (bytes32 pubkeyX, bytes32 pubkeyY) {
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
-        return (accountStorage.pubkeyX, accountStorage.pubkeyY);
+    function getEMVStorage(address account, bytes32 keyHash)
+        external
+        view
+        returns (uint256 expectedATC, bool initialized)
+    {
+        uint256 atcState = emvValidatorStorage[account].keyATCState[keyHash];
+        initialized = (atcState & KEY_INITIALIZED) != 0;
+        expectedATC = atcState & ATC_MASK;
+    }
+
+    function getExpectedATC(address account, bytes32 keyHash) external view returns (uint256 expectedATC) {
+        uint256 atcState = emvValidatorStorage[account].keyATCState[keyHash];
+        if ((atcState & KEY_INITIALIZED) == 0) {
+            revert PublicKeyNotRegistered();
+        }
+        return atcState & ATC_MASK;
+    }
+
+    function isPublicKeyRegistered(address account, bytes32 keyHash) external view returns (bool) {
+        return _isPublicKeyRegistered(account, keyHash);
     }
 
     /**
@@ -394,13 +412,16 @@ contract EMVValidator is IValidator {
     }
 
     /**
-     * @dev Validate replay protection and update transaction state in one operation - Storage optimized
+     * @dev Validate replay protection and ATC state without mutating storage
      * @param emvFields The EMV fields calldata to extract data from
      */
-    function _validateReplayProtectionAndUpdateState(bytes calldata emvFields) internal {
+    function _validateReplayProtection(bytes calldata emvFields, address account, bytes32 keyHash)
+        internal
+        view
+        returns (bytes4 unpredictableNumberBytes, uint256 currentATC)
+    {
         // Extract values using assembly for efficiency
         (uint256 unpredictableNumberOffset, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
-        bytes4 unpredictableNumberBytes;
         bytes2 atcBytes;
         assembly {
             unpredictableNumberBytes := calldataload(add(emvFields.offset, unpredictableNumberOffset))
@@ -411,64 +432,59 @@ contract EMVValidator is IValidator {
         uint16 receivedATC = uint16(atcBytes);
 
         // Load storage once and cache the slot
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
-        uint16 currentATC = accountStorage.expectedATC;
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
+        uint256 keyATCState = accountStorage.keyATCState[keyHash];
+
+        if ((keyATCState & KEY_INITIALIZED) == 0) {
+            revert PublicKeyNotRegistered();
+        }
+
+        currentATC = keyATCState & ATC_MASK;
+        if (currentATC > ATC_MAX) {
+            revert ATCExhausted(keyHash);
+        }
 
         // Validate replay protection
         if (accountStorage.usedUnpredictableNumbers[unpredictableNumber]) {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
-        if (receivedATC < currentATC) {
-            revert InvalidATCSequence(currentATC, receivedATC);
+        if (uint256(receivedATC) != currentATC) {
+            revert InvalidATCSequence(uint16(currentATC), receivedATC);
+        }
+    }
+
+    function _updateReplayProtectionAndATC(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC)
+        internal
+    {
+        if (currentATC == ATC_MAX) {
+            revert ATCExhausted(keyHash);
         }
 
-        // Update state after validation passes (batch storage writes)
-        accountStorage.usedUnpredictableNumbers[unpredictableNumber] = true;
-        accountStorage.expectedATC = currentATC + 1;
+        uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
+        uint256 nextATC = currentATC + 1;
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
 
-        // Emit combined event
-        emit ReplayProtectionUpdated(msg.sender, unpredictableNumberBytes, currentATC + 1);
+        accountStorage.usedUnpredictableNumbers[unpredictableNumber] = true;
+        accountStorage.keyATCState[keyHash] = KEY_INITIALIZED | nextATC;
+
+        emit ReplayProtectionUpdated(msg.sender, keyHash, unpredictableNumberBytes, nextATC);
     }
 
     /**
-     * @dev Assemble EMV dynamic data directly from EMV fields
-     * @param emvFields The EMV transaction fields
-     * @return dynamicData The assembled dynamic data for signature verification
-     */
-    /**
      * @dev Verify EMV P-256 ECDSA signature
-     * @param signature The ECDSA signature bytes (must be 64 bytes: r||s)
+     * @param pubkeyX The supplied P-256 public key x coordinate
+     * @param pubkeyY The supplied P-256 public key y coordinate
+     * @param r The ECDSA signature r value
+     * @param s The ECDSA signature s value
      * @param emvFields The packed EMV fields from calldata
-     * @param account The account address to validate signature for
      * @return true if signature is valid, false otherwise
      */
-    function _verifyEMVSignature(bytes calldata signature, bytes calldata emvFields, address account)
+    function _verifyEMVSignature(bytes calldata emvFields, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s)
         internal
         view
         returns (bool)
     {
-        // Validate signature length (must be 64 bytes: r||s)
-        if (signature.length != 64) {
-            revert InvalidSignatureLength(signature.length);
-        }
-
-        // Get registered P-256 public key
-        bytes32 pubkeyX = emvValidatorStorage[account].pubkeyX;
-        bytes32 pubkeyY = emvValidatorStorage[account].pubkeyY;
-
-        if (pubkeyX == bytes32(0) || pubkeyY == bytes32(0)) {
-            revert PublicKeyNotRegistered();
-        }
-
-        // Extract signature components: r (32 bytes) || s (32 bytes)
-        bytes32 r;
-        bytes32 s;
-        assembly {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-        }
-
         (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset) =
             _emvFieldOffsets(emvFields);
 
@@ -483,5 +499,31 @@ contract EMVValidator is IValidator {
 
         // Verify ECDSA signature using P256 library
         return P256.verifySignature(messageHash, r, s, pubkeyX, pubkeyY);
+    }
+
+    function _decodeEMVSignature(bytes calldata signature)
+        internal
+        pure
+        returns (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s)
+    {
+        if (signature.length != 160) {
+            revert InvalidSignatureLength(signature.length);
+        }
+
+        assembly {
+            keyHash := calldataload(signature.offset)
+            pubkeyX := calldataload(add(signature.offset, 32))
+            pubkeyY := calldataload(add(signature.offset, 64))
+            r := calldataload(add(signature.offset, 96))
+            s := calldataload(add(signature.offset, 128))
+        }
+    }
+
+    function _isValidPublicKeyHash(bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY) internal pure returns (bool) {
+        return computeKeyHash(pubkeyX, pubkeyY) == keyHash;
+    }
+
+    function _isPublicKeyRegistered(address account, bytes32 keyHash) internal view returns (bool) {
+        return (emvValidatorStorage[account].keyATCState[keyHash] & KEY_INITIALIZED) != 0;
     }
 }

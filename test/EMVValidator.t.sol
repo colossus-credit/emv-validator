@@ -6,6 +6,7 @@ import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
+import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
 
 interface IP256VerifierCodeDeployer {
@@ -20,7 +21,9 @@ contract EMVValidatorTest is KernelTestBase {
 
     // Event declarations for testing
     event EMVSignatureValidated(address indexed kernel, bool success);
-    event ReplayProtectionUpdated(address indexed kernel, bytes4 unpredictableNumber, uint16 newATC);
+    event ReplayProtectionUpdated(
+        address indexed kernel, bytes32 indexed keyHash, bytes4 unpredictableNumber, uint256 newATC
+    );
     event EMVTransferExecuted(
         address indexed from,
         address indexed to,
@@ -67,13 +70,23 @@ contract EMVValidatorTest is KernelTestBase {
     bytes constant TEST_SIGNATURE = hex"9bbbe1037a8906e7324a5bc583b51f109779afd8ae5c6739ecd6d82e66b48ae4" // r
         hex"068dd48c7554807e9be40a39e08717f28a1f98def1a534fd7ca1de1699aae415"; // s
 
+    function _testKeyHash() internal pure returns (bytes32) {
+        return keccak256(abi.encode(TEST_PUBKEY_X, TEST_PUBKEY_Y));
+    }
+
+    function _createEMVSignature() internal pure returns (bytes memory) {
+        return abi.encodePacked(_testKeyHash(), TEST_PUBKEY_X, TEST_PUBKEY_Y, TEST_SIGNATURE);
+    }
+
     function setUp() public override {
         super.setUp(); // Initialize KernelTestBase
 
-        address p256VerifierCodeDeployer =
-            deployCode("test/utils/P256VerifierCodeDeployer.sol:P256VerifierCodeDeployer");
-        bytes memory p256VerifierCode = IP256VerifierCodeDeployer(p256VerifierCodeDeployer).deployRuntimeCode();
-        vm.etch(address(0x100), p256VerifierCode);
+        if (!P256.hasPrecompile()) {
+            address p256VerifierCodeDeployer =
+                deployCode("test/utils/P256VerifierCodeDeployer.sol:P256VerifierCodeDeployer");
+            bytes memory p256VerifierCode = IP256VerifierCodeDeployer(p256VerifierCodeDeployer).deployRuntimeCode();
+            vm.etch(address(0x100), p256VerifierCode);
+        }
 
         // Deploy EMV components
         acquirerConfig = new AcquirerConfig();
@@ -196,19 +209,15 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function _createEMVTransactionData() internal pure returns (bytes memory) {
-        // Legacy format for tests that need both fields and signature
-        // New format: EMV fields (63 bytes) + RSA signature (256 bytes) = 319 bytes
-        return abi.encodePacked(
-            _createEMVFields(),
-            TEST_SIGNATURE // 256 bytes
-        );
+        // Legacy format for tests that need both fields and signature.
+        return abi.encodePacked(_createEMVFields(), TEST_SIGNATURE);
     }
 
     function _createInvalidEMVTransactionData() internal pure returns (bytes memory) {
         // Encode without padding to allow single-slice extraction - with invalid signature length
         return abi.encodePacked(
             _createEMVFields(),
-            hex"deadbeef" // Invalid signature (4 bytes instead of 256) - will trigger InvalidRSAKeySize
+            hex"deadbeef" // Invalid short signature
         );
     }
 
@@ -240,8 +249,12 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function _encodeSimpleTransferCall() internal view returns (bytes memory) {
+        return _encodeSimpleTransferCall(_createEMVFields());
+    }
+
+    function _encodeSimpleTransferCall(bytes memory emvFields) internal view returns (bytes memory) {
         // Call through Kernel's execute function using delegate call to EMVSettlement
-        // Now only passes EMV fields (63 bytes) to settlement, not the signature
+        // Only passes EMV fields to settlement, not the signature.
         return abi.encodeWithSelector(
             kernel.execute.selector,
             ExecLib.encode(
@@ -250,10 +263,7 @@ contract EMVValidatorTest is KernelTestBase {
             abi.encodePacked(
                 address(emvSettlement), // delegate target (20 bytes)
                 // For delegatecall: no value field, just target + calldata
-                abi.encodeWithSelector(
-                    emvSettlement.execute.selector,
-                    _createEMVFields() // Now only EMV fields (63 bytes)
-                )
+                abi.encodeWithSelector(emvSettlement.execute.selector, emvFields)
             )
         );
     }
@@ -267,10 +277,10 @@ contract EMVValidatorTest is KernelTestBase {
             0 // parallel key
         );
 
-        // Prepare signature: valid RSA signature (256 bytes) or invalid short signature
+        // Prepare signature: valid P-256 envelope or invalid short signature
         bytes memory signature;
         if (success) {
-            signature = TEST_SIGNATURE;
+            signature = _createEMVSignature();
         } else {
             signature = hex"deadbeef";
         }
@@ -284,7 +294,7 @@ contract EMVValidatorTest is KernelTestBase {
             preVerificationGas: 1000000,
             gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
             paymasterAndData: "",
-            signature: signature // Just RSA signature (256 bytes) or invalid
+            signature: signature
         });
     }
 
@@ -388,7 +398,7 @@ contract EMVValidatorTest is KernelTestBase {
             false // invalid signature
         );
 
-        // Expect the operation to fail due to invalid signature format (now caught by RSA key size validation)
+        // Expect the operation to fail due to invalid signature format.
         vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
     }
@@ -1041,22 +1051,21 @@ contract EMVValidatorTest is KernelTestBase {
     function test_EMVValidatorUninstall() public whenInitialized {
         _installEMVValidator();
 
-        // Verify public key is registered
-        (bytes32 pubkeyX, bytes32 pubkeyY) = emvValidator.getRegisteredPublicKey(address(kernel));
-        assertEq(pubkeyX, TEST_PUBKEY_X);
-        assertEq(pubkeyY, TEST_PUBKEY_Y);
+        bytes32 keyHash = _testKeyHash();
+
+        // Verify public key hash is registered
+        assertTrue(emvValidator.isPublicKeyRegistered(address(kernel), keyHash));
+        (uint256 expectedATC, bool initialized) = emvValidator.getEMVStorage(address(kernel), keyHash);
+        assertTrue(initialized);
+        assertEq(expectedATC, 0);
 
         // Call onUninstall
         vm.prank(address(kernel));
         emvValidator.onUninstall("");
 
-        // Verify ATC was reset
-        assertEq(emvValidator.getEMVStorage(address(kernel)), 0);
-
-        // Verify public key was cleared
-        (bytes32 pubkeyXAfter, bytes32 pubkeyYAfter) = emvValidator.getRegisteredPublicKey(address(kernel));
-        assertEq(pubkeyXAfter, bytes32(0));
-        assertEq(pubkeyYAfter, bytes32(0));
+        // onUninstall only clears the account-level isInitialized state.
+        assertFalse(emvValidator.isInitialized(address(kernel)));
+        assertTrue(emvValidator.isPublicKeyRegistered(address(kernel), keyHash));
     }
 
     function test_EMVValidatorIsInitialized() public {
@@ -1083,7 +1092,7 @@ contract EMVValidatorTest is KernelTestBase {
         _installEMVValidator();
 
         // Create EMV data with invalid currency (not 840 or 997)
-        bytes memory invalidCurrencyData = abi.encodePacked(
+        bytes memory invalidCurrencyFields = abi.encodePacked(
             TEST_ARQC, // 8 bytes
             TEST_UNPREDICTABLE_NUMBER, // 4 bytes
             TEST_ATC, // 2 bytes
@@ -1095,13 +1104,11 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS, // 3 bytes
             TEST_TERMINAL_ID, // 8 bytes
             TEST_MERCHANT_ID, // 15 bytes
-            TEST_ACQUIRER_ID, // 6 bytes
-            TEST_SIGNATURE // 256 bytes
+            TEST_ACQUIRER_ID // 6 bytes
         );
 
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
-        ops[0].signature = invalidCurrencyData;
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(invalidCurrencyFields), true);
 
         vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
@@ -1143,13 +1150,12 @@ contract EMVValidatorTest is KernelTestBase {
         );
 
         // Test isValidSignatureWithSender - should return ERC1271_MAGICVALUE for valid signature
-        // For P-256, we pass the signature (64 bytes: r||s)
-        bytes4 result = emvValidator.isValidSignatureWithSender(address(this), signedDataHash, TEST_SIGNATURE);
+        bytes4 result = emvValidator.isValidSignatureWithSender(address(this), signedDataHash, _createEMVSignature());
         assertEq(result, ERC1271_MAGICVALUE);
 
         // Test with invalid signature (wrong hash)
         bytes32 wrongHash = keccak256("wrong data");
-        bytes4 invalidResult = emvValidator.isValidSignatureWithSender(address(this), wrongHash, TEST_SIGNATURE);
+        bytes4 invalidResult = emvValidator.isValidSignatureWithSender(address(this), wrongHash, _createEMVSignature());
         assertEq(invalidResult, ERC1271_INVALID);
     }
 
@@ -1261,7 +1267,7 @@ contract EMVValidatorTest is KernelTestBase {
         mockERC20.transfer(address(kernel), 1e20);
         vm.deal(address(kernel), 1e18);
 
-        // Create a UserOp with signature that fails RSA validation
+        // Create a UserOp with signature that fails P-256 validation
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
         ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), false); // false = invalid signature
 
@@ -1277,7 +1283,7 @@ contract EMVValidatorTest is KernelTestBase {
         vm.deal(address(kernel), 2e18);
 
         // Create EMV data with wrong ATC (skipping sequence)
-        bytes memory wrongATCData = abi.encodePacked(
+        bytes memory wrongATCFields = abi.encodePacked(
             TEST_ARQC, // 8 bytes
             hex"55667788", // Different unpredictable number
             hex"0005", // ATC = 5 (but expected is 0)
@@ -1289,13 +1295,11 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,
             TEST_TERMINAL_ID,
             TEST_MERCHANT_ID,
-            TEST_ACQUIRER_ID,
-            TEST_SIGNATURE // 256 bytes
+            TEST_ACQUIRER_ID
         );
 
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
-        ops[0].signature = wrongATCData;
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(wrongATCFields), true);
 
         vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
@@ -1422,24 +1426,41 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(feeRec.length, 1); // Only merchant when all fees are 0
     }
 
-    function test_GetRegisteredPublicKey() public whenInitialized {
+    function test_GetRegisteredKeyHash() public whenInitialized {
         _installEMVValidator();
 
-        // Get the registered public key
-        (bytes32 pubkeyX, bytes32 pubkeyY) = emvValidator.getRegisteredPublicKey(address(kernel));
+        bytes32 keyHash = _testKeyHash();
 
-        // Verify it matches what we installed
-        assertEq(pubkeyX, TEST_PUBKEY_X, "PubkeyX should match installed value");
-        assertEq(pubkeyY, TEST_PUBKEY_Y, "PubkeyY should match installed value");
+        assertEq(emvValidator.computeKeyHash(TEST_PUBKEY_X, TEST_PUBKEY_Y), keyHash);
+        assertTrue(emvValidator.isPublicKeyRegistered(address(kernel), keyHash), "Key hash should be registered");
+
+        (uint256 expectedATC, bool initialized) = emvValidator.getEMVStorage(address(kernel), keyHash);
+        assertTrue(initialized);
+        assertEq(expectedATC, 0, "ATC should match installed value");
     }
 
-    function test_GetRegisteredPublicKey_NotInstalled() public {
-        // Try to get public key for an account that never installed
-        (bytes32 pubkeyX, bytes32 pubkeyY) = emvValidator.getRegisteredPublicKey(address(0x123));
+    function test_GetRegisteredKeyHash_NotInstalled() public {
+        bytes32 keyHash = _testKeyHash();
 
-        // Should return zero values
-        assertEq(pubkeyX, bytes32(0), "PubkeyX should be zero for uninstalled account");
-        assertEq(pubkeyY, bytes32(0), "PubkeyY should be zero for uninstalled account");
+        assertFalse(emvValidator.isPublicKeyRegistered(address(0x123), keyHash));
+        (uint256 expectedATC, bool initialized) = emvValidator.getEMVStorage(address(0x123), keyHash);
+        assertFalse(initialized);
+        assertEq(expectedATC, 0);
+    }
+
+    function test_MultiplePublicKeysCanBeInstalledForSameAccount() public {
+        bytes32 secondPubkeyX = bytes32(uint256(0x1234));
+        bytes32 secondPubkeyY = bytes32(uint256(0x5678));
+        bytes32 secondKeyHash = emvValidator.computeKeyHash(secondPubkeyX, secondPubkeyY);
+
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        emvValidator.onInstall(abi.encode(uint16(7), secondPubkeyX, secondPubkeyY));
+
+        assertTrue(emvValidator.isInitialized(address(this)));
+        assertTrue(emvValidator.isPublicKeyRegistered(address(this), _testKeyHash()));
+        assertTrue(emvValidator.isPublicKeyRegistered(address(this), secondKeyHash));
+        assertEq(emvValidator.getExpectedATC(address(this), _testKeyHash()), 0);
+        assertEq(emvValidator.getExpectedATC(address(this), secondKeyHash), 7);
     }
 
     function test_InvalidSender() public {
@@ -1682,7 +1703,7 @@ contract EMVValidatorTest is KernelTestBase {
             preVerificationGas: 2000000,
             gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
             paymasterAndData: "",
-            signature: TEST_SIGNATURE
+            signature: _createEMVSignature()
         });
 
         console.log("=== Executing EMV Transaction ===");
@@ -1713,7 +1734,7 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(merchantReceived, expectedMerchantAmount, "Merchant should receive correct amount after fees");
 
         // STEP 9: Verify ATC was incremented
-        assertEq(emvValidator.getEMVStorage(address(kernel)), 1, "ATC should be incremented to 1");
+        assertEq(emvValidator.getExpectedATC(address(kernel), _testKeyHash()), 1, "ATC should be incremented to 1");
 
         console.log("Complete end-to-end FFI EMV transaction successful!");
         console.log("Merchant received:", merchantReceived / 1e18, "tokens");
