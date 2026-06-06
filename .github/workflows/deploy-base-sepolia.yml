@@ -1,0 +1,109 @@
+name: Deploy Base Sepolia
+
+on:
+  release:
+    types: [published]
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  deploy:
+    name: Deploy and verify
+    runs-on: ubuntu-latest
+    environment: base-sepolia
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Show Forge version
+        run: forge --version
+
+      - name: Run Forge build
+        run: forge build --sizes
+
+      - name: Run Forge tests
+        run: forge test -vvv
+
+      - name: Deploy and verify contracts
+        env:
+          BASE_SEPOLIA_RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+          TOKEN_DECIMALS: ${{ vars.BASE_SEPOLIA_TOKEN_DECIMALS }}
+          INITIAL_TOKEN_SUPPLY: ${{ vars.BASE_SEPOLIA_INITIAL_TOKEN_SUPPLY }}
+        run: |
+          : "${BASE_SEPOLIA_RPC_URL:?Missing BASE_SEPOLIA_RPC_URL secret}"
+          : "${DEPLOYER_PRIVATE_KEY:?Missing DEPLOYER_PRIVATE_KEY secret}"
+          : "${BASESCAN_API_KEY:?Missing BASESCAN_API_KEY secret}"
+          export TOKEN_DECIMALS="${TOKEN_DECIMALS:-18}"
+          export INITIAL_TOKEN_SUPPLY="${INITIAL_TOKEN_SUPPLY:-0}"
+
+          forge script script/DeployBaseSepolia.s.sol:DeployBaseSepolia \
+            --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+            --broadcast \
+            --verify \
+            --verifier etherscan \
+            --etherscan-api-key "$BASESCAN_API_KEY" \
+            --chain 84532 \
+            --slow \
+            -vvvv
+
+      - name: Build deployment summary
+        run: |
+          run_json="broadcast/DeployBaseSepolia.s.sol/84532/run-latest.json"
+          test -f "$run_json"
+
+          cat > deployment-summary.md <<'EOF'
+          ## Base Sepolia Deployment
+
+          | Contract | Address | BaseScan |
+          | --- | --- | --- |
+          EOF
+
+          jq -r '.transactions[] | select(.transactionType == "CREATE") | [.contractName, .contractAddress] | @tsv' "$run_json" \
+            | while IFS=$'\t' read -r contract address; do
+                echo "| \`$contract\` | \`$address\` | [view](https://sepolia.basescan.org/address/$address) |" \
+                  >> deployment-summary.md
+              done
+
+          {
+            echo ""
+            echo "- Network: Base Sepolia"
+            echo "- Chain ID: \`84532\`"
+            echo "- Release: \`${{ github.event.release.tag_name }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+          } >> deployment-summary.md
+
+      - name: Write deployment summary to release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+
+            const startMarker = "<!-- base-sepolia-deployment:start -->";
+            const endMarker = "<!-- base-sepolia-deployment:end -->";
+            const summary = fs.readFileSync("deployment-summary.md", "utf8").trim();
+            const section = `${startMarker}\n${summary}\n${endMarker}`;
+
+            const { owner, repo } = context.repo;
+            const release_id = context.payload.release.id;
+            const { data: release } = await github.rest.repos.getRelease({ owner, repo, release_id });
+            const body = release.body || "";
+            const pattern = new RegExp(`${startMarker}[\\s\\S]*?${endMarker}`);
+            const nextBody = pattern.test(body)
+              ? body.replace(pattern, section)
+              : [body.trim(), section].filter(Boolean).join("\n\n");
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id,
+              body: nextBody,
+            });
