@@ -60,6 +60,58 @@ jobs:
             --slow \
             -vvvv
 
+      - name: Export deployment addresses
+        env:
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+        run: |
+          : "${DEPLOYER_PRIVATE_KEY:?Missing DEPLOYER_PRIVATE_KEY secret}"
+          run_json="broadcast/DeployBaseSepolia.s.sol/84532/run-latest.json"
+          test -f "$run_json"
+
+          extract_address() {
+            jq -er --arg contract "$1" \
+              '[.transactions[]
+                | select(.transactionType == "CREATE" and .contractName == $contract)
+                | .contractAddress] | last // empty' \
+              "$run_json"
+          }
+
+          deployer_address="$(cast wallet address --private-key "$DEPLOYER_PRIVATE_KEY")"
+          token_address="$(extract_address ColossusTestToken)"
+          acquirer_config_address="$(extract_address AcquirerConfig)"
+          emv_settlement_address="$(extract_address EMVSettlement)"
+          emv_validator_address="$(extract_address EMVValidator)"
+
+          {
+            echo "DEPLOYER_ADDRESS=$deployer_address"
+            echo "TOKEN_ADDRESS=$token_address"
+            echo "ACQUIRER_CONFIG_ADDRESS=$acquirer_config_address"
+            echo "EMV_SETTLEMENT_ADDRESS=$emv_settlement_address"
+            echo "EMV_VALIDATOR_ADDRESS=$emv_validator_address"
+          } >> "$GITHUB_ENV"
+
+      - name: Smoke test deployed contracts
+        id: smoke
+        env:
+          BASE_SEPOLIA_RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
+          TOKEN_DECIMALS: ${{ vars.BASE_SEPOLIA_TOKEN_DECIMALS }}
+          INITIAL_TOKEN_SUPPLY: ${{ vars.BASE_SEPOLIA_INITIAL_TOKEN_SUPPLY }}
+        run: |
+          : "${BASE_SEPOLIA_RPC_URL:?Missing BASE_SEPOLIA_RPC_URL secret}"
+          : "${DEPLOYER_ADDRESS:?Missing DEPLOYER_ADDRESS from deployment export}"
+          : "${TOKEN_ADDRESS:?Missing TOKEN_ADDRESS from deployment broadcast}"
+          : "${ACQUIRER_CONFIG_ADDRESS:?Missing ACQUIRER_CONFIG_ADDRESS from deployment broadcast}"
+          : "${EMV_SETTLEMENT_ADDRESS:?Missing EMV_SETTLEMENT_ADDRESS from deployment broadcast}"
+          : "${EMV_VALIDATOR_ADDRESS:?Missing EMV_VALIDATOR_ADDRESS from deployment broadcast}"
+
+          export TOKEN_DECIMALS="${TOKEN_DECIMALS:-6}"
+          export INITIAL_TOKEN_SUPPLY="${INITIAL_TOKEN_SUPPLY:-0}"
+
+          forge script script/SmokeBaseSepolia.s.sol:SmokeBaseSepolia \
+            --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+            --chain 84532 \
+            -vvvv
+
       - name: Build deployment summary
         if: always()
         run: |
@@ -85,6 +137,7 @@ jobs:
             echo "- Chain ID: \`84532\`"
             echo "- Release: \`${{ github.event.release.tag_name }}\`"
             echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Smoke test: \`${{ steps.smoke.outcome }}\`"
           } >> deployment-summary.md
 
       - name: Write deployment summary to release

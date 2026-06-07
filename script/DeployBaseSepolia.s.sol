@@ -6,8 +6,13 @@ import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {ColossusTestToken} from "../src/ColossusTestToken.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {EMVValidator} from "../src/EMVValidator.sol";
+import {IERC7579Account} from "kernel/src/interfaces/IERC7579Account.sol";
 
 contract DeployBaseSepolia is Script {
+    function validatorSelector() public pure returns (bytes4) {
+        return IERC7579Account.execute.selector;
+    }
+
     function run()
         external
         returns (
@@ -35,7 +40,11 @@ contract DeployBaseSepolia is Script {
         }
         acquirerConfig = new AcquirerConfig();
         emvSettlement = new EMVSettlement(address(token), address(acquirerConfig), uint8(tokenDecimals), deployer);
-        emvValidator = new EMVValidator(address(emvSettlement), EMVSettlement.execute.selector);
+        emvValidator = new EMVValidator(address(emvSettlement), validatorSelector());
+
+        (address validationTarget, bytes4 validationSelector) = emvValidator.getValidationConfig();
+        require(validationTarget == address(emvSettlement), "invalid validator target");
+        require(validationSelector == validatorSelector(), "invalid validator selector");
 
         vm.stopBroadcast();
 
