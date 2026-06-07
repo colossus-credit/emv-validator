@@ -5,6 +5,7 @@ import "lib/kernel/test/base/KernelTestBase.sol";
 import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
+import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
@@ -1173,6 +1174,13 @@ contract EMVValidatorTest is KernelTestBase {
         (address targetAddr, bytes4 funcSelector) = emvValidator.getValidationConfig();
         assertEq(targetAddr, address(emvSettlement));
         assertEq(funcSelector, kernel.execute.selector);
+    }
+
+    function test_DeployBaseSepoliaUsesAccountExecuteSelector() public {
+        DeployBaseSepolia deployScript = new DeployBaseSepolia();
+
+        assertEq(deployScript.validatorSelector(), kernel.execute.selector);
+        assertTrue(deployScript.validatorSelector() != EMVSettlement.execute.selector);
     }
 
     function test_EMVValidatorInvalidCurrency() public whenInitialized {
