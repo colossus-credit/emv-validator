@@ -66,9 +66,9 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     // Valid P-256 ECDSA signature (r||s, 64 bytes)
-    // Signed data: SHA-256(UN || Amount || Currency || ATC) = SHA-256(1234567800000001000008400000)
-    bytes constant TEST_SIGNATURE = hex"9bbbe1037a8906e7324a5bc583b51f109779afd8ae5c6739ecd6d82e66b48ae4" // r
-        hex"068dd48c7554807e9be40a39e08717f28a1f98def1a534fd7ca1de1699aae415"; // s
+    // Signed data: SHA-256(63-byte packed EMV validator payload)
+    bytes constant TEST_SIGNATURE = hex"097e0f480a8f104de2da4cf6330bdc80e037e960a962320633d50140c6a7041a" // r
+        hex"60c07436cd16d4d1073aff90d4a839cc053d3b953e8b87b1e76b96d4b7321dea"; // s
 
     function _testKeyHash() internal pure returns (bytes32) {
         return keccak256(abi.encode(TEST_PUBKEY_X, TEST_PUBKEY_Y));
@@ -208,6 +208,26 @@ contract EMVValidatorTest is KernelTestBase {
         );
     }
 
+    function _signedPayloadHash() internal pure returns (bytes32) {
+        return sha256(_createEMVFields());
+    }
+
+    function _createEMVFieldsWithByte(uint256 offset, bytes1 value) internal pure returns (bytes memory fields) {
+        fields = _createEMVFields();
+        fields[offset] = value;
+    }
+
+    function _replaceEMVField(bytes memory fields, uint256 offset, bytes memory value)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        for (uint256 i = 0; i < value.length; i++) {
+            fields[offset + i] = value[i];
+        }
+        return fields;
+    }
+
     function _createEMVTransactionData() internal pure returns (bytes memory) {
         // Legacy format for tests that need both fields and signature.
         return abi.encodePacked(_createEMVFields(), TEST_SIGNATURE);
@@ -296,6 +316,14 @@ contract EMVValidatorTest is KernelTestBase {
             paymasterAndData: "",
             signature: signature
         });
+    }
+
+    function _expectInvalidEMVPayload(bytes memory emvFields) internal {
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(emvFields), true);
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
     }
 
     function test_Deployment() public whenInitialized {
@@ -401,6 +429,65 @@ contract EMVValidatorTest is KernelTestBase {
         // Expect the operation to fail due to invalid signature format.
         vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVSignatureBindsARQCDateTxnTypeTVRAndCVMResults() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e21);
+        vm.deal(address(kernel), 1e18);
+
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(0, bytes1(0x99))); // ARQC
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(22, bytes1(0x24))); // Date
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(25, bytes1(0x01))); // Transaction type
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(26, bytes1(0x80))); // TVR
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(31, bytes1(0x01))); // CVM results
+    }
+
+    function test_EMVValidatorRejectsCompactPayload() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e21);
+        vm.deal(address(kernel), 1e18);
+
+        bytes memory compactFields = abi.encodePacked(
+            bytes3("ICC"),
+            TEST_AMOUNT,
+            TEST_UNPREDICTABLE_NUMBER,
+            TEST_TERMINAL_ID,
+            TEST_MERCHANT_ID,
+            TEST_ATC,
+            TEST_CURRENCY
+        );
+
+        _expectInvalidEMVPayload(compactFields);
+    }
+
+    function test_EMVSignatureBindsSettlementRoutingFields() public whenInitialized {
+        _installEMVValidator();
+
+        mockERC20.transfer(address(kernel), 1e21);
+        vm.deal(address(kernel), 1e18);
+
+        address attackerMerchant = makeAddr("attackerMerchant");
+        address attackerFeeRecipient = makeAddr("attackerFeeRecipient");
+        uint48 attackerAcquirerId = bytesToUint48(bytes6("BADACQ"));
+        uint120 attackerMerchantId = bytesToUint120(bytes15("BADMERCHANT0001"));
+        uint64 attackerTerminalId = bytesToUint64(bytes8("BADTERM1"));
+
+        acquirerConfig.setAcquirer(attackerAcquirerId, address(this));
+        acquirerConfig.setAcquirerFee(attackerAcquirerId, attackerFeeRecipient, 25);
+        acquirerConfig.setSwipeFee(attackerAcquirerId, 50 * 10 ** 16);
+        acquirerConfig.setMerchant(attackerAcquirerId, attackerMerchantId, attackerMerchant);
+        acquirerConfig.setTerminal(attackerAcquirerId, attackerTerminalId, attackerFeeRecipient);
+
+        bytes memory reroutedFields = _createEMVFields();
+        reroutedFields = _replaceEMVField(reroutedFields, 34, abi.encodePacked(bytes8("BADTERM1")));
+        reroutedFields = _replaceEMVField(reroutedFields, 42, abi.encodePacked(bytes15("BADMERCHANT0001")));
+        reroutedFields = _replaceEMVField(reroutedFields, 57, abi.encodePacked(bytes6("BADACQ")));
+
+        _expectInvalidEMVPayload(reroutedFields);
+        assertEq(mockERC20.balanceOf(attackerMerchant), 0, "Rerouted merchant should not receive funds");
     }
 
     function test_InstallEMVAsValidatorAndExecutor() public whenInitialized {
@@ -1138,16 +1225,8 @@ contract EMVValidatorTest is KernelTestBase {
         // Install the validator with public key for this test contract
         emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
 
-        // For P-256 EMV, the signature is over the 14-byte data: UN || Amount || Currency || ATC
-        // Compute hash of the signed data (not the full dynamic data)
-        bytes32 signedDataHash = sha256(
-            abi.encodePacked(
-                TEST_UNPREDICTABLE_NUMBER, // 4 bytes
-                TEST_AMOUNT, // 6 bytes
-                TEST_CURRENCY, // 2 bytes
-                TEST_ATC // 2 bytes
-            )
-        );
+        // For P-256 EMV, the signature is over the full 63-byte validator payload.
+        bytes32 signedDataHash = _signedPayloadHash();
 
         // Test isValidSignatureWithSender - should return ERC1271_MAGICVALUE for valid signature
         bytes4 result = emvValidator.isValidSignatureWithSender(address(this), signedDataHash, _createEMVSignature());
@@ -1502,26 +1581,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Install validator first
         emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
 
-        // Compute valid hash
-        bytes32 dynamicDataHash = sha256(
-            abi.encodePacked(
-                bytes1(0x6A),
-                bytes1(0x03),
-                TEST_ARQC,
-                TEST_UNPREDICTABLE_NUMBER,
-                TEST_ATC,
-                TEST_AMOUNT,
-                TEST_CURRENCY,
-                TEST_DATE,
-                TEST_TXN_TYPE,
-                TEST_TVR,
-                TEST_CVM_RESULTS,
-                TEST_TERMINAL_ID,
-                TEST_MERCHANT_ID,
-                TEST_ACQUIRER_ID,
-                bytes1(0xBC)
-            )
-        );
+        bytes32 dynamicDataHash = _signedPayloadHash();
 
         // Try with wrong signature length (32 bytes instead of 64)
         bytes memory shortSignature = new bytes(32);
@@ -1535,26 +1595,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Install validator first
         emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
 
-        // Compute valid hash
-        bytes32 dynamicDataHash = sha256(
-            abi.encodePacked(
-                bytes1(0x6A),
-                bytes1(0x03),
-                TEST_ARQC,
-                TEST_UNPREDICTABLE_NUMBER,
-                TEST_ATC,
-                TEST_AMOUNT,
-                TEST_CURRENCY,
-                TEST_DATE,
-                TEST_TXN_TYPE,
-                TEST_TVR,
-                TEST_CVM_RESULTS,
-                TEST_TERMINAL_ID,
-                TEST_MERCHANT_ID,
-                TEST_ACQUIRER_ID,
-                bytes1(0xBC)
-            )
-        );
+        bytes32 dynamicDataHash = _signedPayloadHash();
 
         // Try with empty signature
         bytes memory emptySignature = hex"";
@@ -1570,29 +1611,16 @@ contract EMVValidatorTest is KernelTestBase {
         // Ensure kernel has ETH for gas
         vm.deal(address(kernel), 10 ether);
 
-        bytes memory emvFields = abi.encodePacked(
-            TEST_ARQC,
-            TEST_UNPREDICTABLE_NUMBER,
-            TEST_ATC,
-            TEST_AMOUNT,
-            TEST_CURRENCY,
-            TEST_DATE,
-            TEST_TXN_TYPE,
-            TEST_TVR,
-            TEST_CVM_RESULTS,
-            bytes8("E2ETERM1"),
-            bytes15("E2EMERCHANT001"),
-            bytes6("E2EACQ")
-        );
+        bytes memory emvFields = _createEMVFields();
 
         console.log("=== P-256 Fixture Data ===");
         console.log("EMV Fields:", emvFields.length, "bytes");
         console.log("Signature:", TEST_SIGNATURE.length, "bytes");
 
         // STEP 2: Setup acquirer configuration
-        uint48 e2eAcquirerId = bytesToUint48(bytes6("E2EACQ"));
-        uint120 e2eMerchantId = bytesToUint120(bytes15("E2EMERCHANT001"));
-        uint64 e2eTerminalId = bytesToUint64(bytes8("E2ETERM1"));
+        uint48 e2eAcquirerId = bytesToUint48(bytes6(TEST_ACQUIRER_ID));
+        uint120 e2eMerchantId = bytesToUint120(bytes15(TEST_MERCHANT_ID));
+        uint64 e2eTerminalId = bytesToUint64(bytes8(TEST_TERMINAL_ID));
 
         address e2eMerchant = makeAddr("e2eMerchant");
 
