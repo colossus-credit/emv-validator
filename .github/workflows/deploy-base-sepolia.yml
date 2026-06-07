@@ -45,6 +45,11 @@ jobs:
           export TOKEN_DECIMALS="${TOKEN_DECIMALS:-6}"
           export INITIAL_TOKEN_SUPPLY="${INITIAL_TOKEN_SUPPLY:-0}"
 
+          # Prevent BaseScan from remapping local src/* contracts into lib/kernel/src/*.
+          grep -v '^src/=lib/kernel/src/$' remappings.txt > remappings.deploy.txt
+          mv remappings.deploy.txt remappings.txt
+          forge clean
+
           forge script script/DeployBaseSepolia.s.sol:DeployBaseSepolia \
             --rpc-url "$BASE_SEPOLIA_RPC_URL" \
             --broadcast \
@@ -56,6 +61,7 @@ jobs:
             -vvvv
 
       - name: Build deployment summary
+        if: always()
         run: |
           run_json="broadcast/DeployBaseSepolia.s.sol/84532/run-latest.json"
           test -f "$run_json"
@@ -82,6 +88,7 @@ jobs:
           } >> deployment-summary.md
 
       - name: Write deployment summary to release
+        if: ${{ always() && hashFiles('deployment-summary.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |
