@@ -51,6 +51,7 @@ contract EMVValidator is IValidator {
     uint256 private constant KEY_INITIALIZED = 1 << 255;
     uint256 private constant ATC_MASK = KEY_INITIALIZED - 1;
     uint256 private constant ATC_MAX = type(uint16).max;
+    uint256 private constant EMV_FIELDS_LENGTH = 63;
 
     struct EMVValidatorStorage {
         bool initialized;
@@ -156,7 +157,7 @@ contract EMVValidator is IValidator {
      * @dev Validate EMV CDA signature for ERC-4337 user operation
      * @param userOp The user operation with EMV fields in callData and P-256 signature envelope in signature field
      * @return SIG_VALIDATION_SUCCESS_UINT if valid, SIG_VALIDATION_FAILED_UINT otherwise
-     * @notice The userOpHash parameter is unused as we use SHA-256 hash of the EMV dynamic data
+     * @notice The userOpHash parameter is unused as we use SHA-256 hash of the packed EMV validator payload
      */
     function validateUserOp(
         PackedUserOperation calldata userOp,
@@ -198,7 +199,7 @@ contract EMVValidator is IValidator {
     /**
      * @dev Validate EMV signature for ERC-1271 (view-only, no state changes)
      * @param sender The account address to validate signature for
-     * @param hash The SHA-256 hash of the EMV dynamic data to validate
+     * @param hash The SHA-256 hash of the packed EMV validator payload to validate
      * @param sig The P-256 signature envelope: keyHash || pubkeyX || pubkeyY || r || s
      * @return ERC1271_MAGICVALUE if valid, ERC1271_INVALID otherwise
      */
@@ -355,11 +356,7 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
-        if (emvFields.length == 40) {
-            return (9, 36, 3, 38);
-        }
-
-        if (emvFields.length == 63) {
+        if (emvFields.length == EMV_FIELDS_LENGTH) {
             return (8, 12, 14, 20);
         }
 
@@ -378,7 +375,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract ATC (2 bytes) from packed EMV fields - Assembly optimized
-     * Position 36-37 in 40-byte format
+     * Position 12-13 in the 63-byte validator payload
      */
     function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
@@ -389,7 +386,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract currency (2 bytes) from packed EMV fields - Assembly optimized
-     * Position 38-39 in 40-byte format
+     * Position 20-21 in the 63-byte validator payload
      */
     function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (,,, uint256 currencyOffset) = _emvFieldOffsets(emvFields);
@@ -485,17 +482,7 @@ contract EMVValidator is IValidator {
         view
         returns (bool)
     {
-        (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset) =
-            _emvFieldOffsets(emvFields);
-
-        bytes memory signedMessage = abi.encodePacked(
-            emvFields[unpredictableNumberOffset:unpredictableNumberOffset + 4],
-            emvFields[amountOffset:amountOffset + 6],
-            emvFields[currencyOffset:currencyOffset + 2],
-            emvFields[atcOffset:atcOffset + 2]
-        );
-
-        bytes32 messageHash = sha256(signedMessage);
+        bytes32 messageHash = sha256(emvFields);
 
         // Verify ECDSA signature using P256 library
         return P256.verifySignature(messageHash, r, s, pubkeyX, pubkeyY);
