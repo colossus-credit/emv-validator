@@ -3,9 +3,16 @@ name: Deploy Base Sepolia
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to deploy
+        required: true
+        default: v0.0.2-alpha
 
 env:
   FOUNDRY_PROFILE: ci
+  RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
 jobs:
   deploy:
@@ -17,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.RELEASE_TAG }}
           submodules: recursive
 
       - name: Install Foundry
@@ -57,6 +65,8 @@ jobs:
             --verifier etherscan \
             --etherscan-api-key "$BASESCAN_API_KEY" \
             --chain 84532 \
+            --retries 20 \
+            --delay 15 \
             --slow \
             -vvvv
 
@@ -135,8 +145,8 @@ jobs:
             echo ""
             echo "- Network: Base Sepolia"
             echo "- Chain ID: \`84532\`"
-            echo "- Release: \`${{ github.event.release.tag_name }}\`"
-            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Release: \`$RELEASE_TAG\`"
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
             echo "- Smoke test: \`${{ steps.smoke.outcome }}\`"
           } >> deployment-summary.md
 
@@ -153,8 +163,18 @@ jobs:
             const section = `${startMarker}\n${summary}\n${endMarker}`;
 
             const { owner, repo } = context.repo;
-            const release_id = context.payload.release.id;
-            const { data: release } = await github.rest.repos.getRelease({ owner, repo, release_id });
+            const releaseTag = process.env.RELEASE_TAG;
+            const { data: release } = context.eventName === "release"
+              ? await github.rest.repos.getRelease({
+                  owner,
+                  repo,
+                  release_id: context.payload.release.id,
+                })
+              : await github.rest.repos.getReleaseByTag({
+                  owner,
+                  repo,
+                  tag: releaseTag,
+                });
             const body = release.body || "";
             const pattern = new RegExp(`${startMarker}[\\s\\S]*?${endMarker}`);
             const nextBody = pattern.test(body)
@@ -164,6 +184,6 @@ jobs:
             await github.rest.repos.updateRelease({
               owner,
               repo,
-              release_id,
+              release_id: release.id,
               body: nextBody,
             });
