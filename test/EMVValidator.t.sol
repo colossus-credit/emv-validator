@@ -5,13 +5,135 @@ import "lib/kernel/test/base/KernelTestBase.sol";
 import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
+import {ColossusTestToken} from "../src/ColossusTestToken.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
+import {PackedUserOperation as EMVPackedUserOperation} from "kernel/src/interfaces/PackedUserOperation.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
 
 interface IP256VerifierCodeDeployer {
     function deployRuntimeCode() external returns (bytes memory);
+}
+
+contract AcquirerConfigHarness is AcquirerConfig {
+    function exposedAddZeroRecipient() external {
+        FeeRecipient[] memory feeRecipients = new FeeRecipient[](1);
+        _addOrAccumulateFee(feeRecipients, 0, address(0), 1);
+    }
+
+    function exposedAddAccumulateAndClear(address recipient)
+        external
+        returns (uint256 index, uint256 accumulatedFee, uint256 storedIndex, uint256 clearedIndex)
+    {
+        FeeRecipient[] memory feeRecipients = new FeeRecipient[](2);
+
+        index = _addOrAccumulateFee(feeRecipients, 0, recipient, 10);
+        index = _addOrAccumulateFee(feeRecipients, index, recipient, 5);
+        accumulatedFee = feeRecipients[0].fee;
+
+        assembly {
+            storedIndex := tload(recipient)
+        }
+
+        _clearTransientStorage(feeRecipients, index);
+
+        assembly {
+            clearedIndex := tload(recipient)
+        }
+    }
+}
+
+contract BadAcquirerConfig {
+    enum Mode {
+        ZeroNonMerchantFee,
+        FeesExceedAmount,
+        InvalidMerchantFee
+    }
+
+    Mode public mode;
+    address public feeRecipient = address(0xBEEF);
+    address public merchantRecipient = address(0xCAFE);
+
+    function setMode(Mode newMode) external {
+        mode = newMode;
+    }
+
+    function calculatePaymentDistribution(uint120, uint64, uint48, uint256 totalAmount)
+        external
+        view
+        returns (AcquirerConfig.FeeRecipient[] memory feeRecipients)
+    {
+        if (mode == Mode.InvalidMerchantFee) {
+            feeRecipients = new AcquirerConfig.FeeRecipient[](1);
+            feeRecipients[0] = AcquirerConfig.FeeRecipient({fee: 1, recipient: merchantRecipient});
+            return feeRecipients;
+        }
+
+        feeRecipients = new AcquirerConfig.FeeRecipient[](2);
+        if (mode == Mode.ZeroNonMerchantFee) {
+            feeRecipients[0] = AcquirerConfig.FeeRecipient({fee: 0, recipient: feeRecipient});
+        } else {
+            feeRecipients[0] = AcquirerConfig.FeeRecipient({fee: totalAmount, recipient: feeRecipient});
+        }
+        feeRecipients[1] = AcquirerConfig.FeeRecipient({fee: 0, recipient: merchantRecipient});
+    }
+}
+
+contract EMVSettlementHarness is EMVSettlement {
+    constructor(address token, address config, uint8 tokenDecimals)
+        EMVSettlement(token, config, tokenDecimals, msg.sender)
+    {}
+
+    function exposedExtractAmountFromBCD(bytes calldata bcdAmount, uint8 tokenDecimals)
+        external
+        pure
+        returns (uint256)
+    {
+        return _extractAmountFromBCD(bcdAmount, tokenDecimals);
+    }
+}
+
+contract EMVValidatorHarness is EMVValidator {
+    constructor(address target, bytes4 selector) EMVValidator(target, selector) {}
+
+    function exposedExtractUnpredictableNumber(bytes calldata emvFields) external pure returns (bytes4) {
+        return _extractUnpredictableNumber(emvFields);
+    }
+
+    function exposedExtractATC(bytes calldata emvFields) external pure returns (bytes2) {
+        return _extractATC(emvFields);
+    }
+
+    function exposedExtractCurrency(bytes calldata emvFields) external pure returns (bytes2) {
+        return _extractCurrency(emvFields);
+    }
+
+    function exposedValidateTargetAndSelector(bytes calldata callData) external view {
+        _validateTargetAndSelector(callData);
+    }
+
+    function exposedValidateReplayProtection(bytes calldata emvFields, address account, bytes32 keyHash)
+        external
+        view
+        returns (bytes4 unpredictableNumberBytes, uint256 currentATC)
+    {
+        return _validateReplayProtection(emvFields, account, keyHash);
+    }
+
+    function exposedUpdateReplayProtectionAndATC(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC)
+        external
+    {
+        _updateReplayProtectionAndATC(keyHash, unpredictableNumberBytes, currentATC);
+    }
+
+    function exposedDecodeEMVSignature(bytes calldata signature)
+        external
+        pure
+        returns (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s)
+    {
+        return _decodeEMVSignature(signature);
+    }
 }
 
 contract EMVValidatorTest is KernelTestBase {
@@ -75,6 +197,12 @@ contract EMVValidatorTest is KernelTestBase {
 
     function _testKeyHash() internal pure returns (bytes32) {
         return keccak256(abi.encode(TEST_PUBKEY_X, TEST_PUBKEY_Y));
+    }
+
+    function _keyATCStateSlot(address account, bytes32 keyHash) internal pure returns (bytes32) {
+        bytes32 accountSlot = keccak256(abi.encode(account, uint256(0)));
+        bytes32 keyATCStateSlot = bytes32(uint256(accountSlot) + 2);
+        return keccak256(abi.encode(keyHash, keyATCStateSlot));
     }
 
     function _createEMVSignature() internal pure returns (bytes memory) {
@@ -318,6 +446,24 @@ contract EMVValidatorTest is KernelTestBase {
             gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
             paymasterAndData: "",
             signature: signature
+        });
+    }
+
+    function _toEMVValidatorUserOp(PackedUserOperation memory op)
+        internal
+        pure
+        returns (EMVPackedUserOperation memory directOp)
+    {
+        directOp = EMVPackedUserOperation({
+            sender: op.sender,
+            nonce: op.nonce,
+            initCode: op.initCode,
+            callData: op.callData,
+            accountGasLimits: op.accountGasLimits,
+            preVerificationGas: op.preVerificationGas,
+            gasFees: op.gasFees,
+            paymasterAndData: op.paymasterAndData,
+            signature: op.signature
         });
     }
 
@@ -1513,6 +1659,204 @@ contract EMVValidatorTest is KernelTestBase {
             testConfig.calculatePaymentDistribution(1, 1, newAcquirer, 1 ether);
 
         assertEq(feeRec.length, 1); // Only merchant when all fees are 0
+    }
+
+    function test_Coverage_AcquirerConfigInternalBranches() public {
+        AcquirerConfigHarness harness = new AcquirerConfigHarness();
+        address sharedRecipient = makeAddr("sharedRecipient");
+
+        (uint256 index, uint256 accumulatedFee, uint256 storedIndex, uint256 clearedIndex) =
+            harness.exposedAddAccumulateAndClear(sharedRecipient);
+
+        assertEq(index, 1);
+        assertEq(accumulatedFee, 15);
+        assertEq(storedIndex, 1);
+        assertEq(clearedIndex, 0);
+
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.InvalidFee.selector, uint256(0)));
+        harness.exposedAddZeroRecipient();
+    }
+
+    function test_Coverage_ColossusTestToken() public {
+        address owner = makeAddr("colossusTokenOwner");
+        address recipient = makeAddr("colossusTokenRecipient");
+        ColossusTestToken token = new ColossusTestToken(owner, 6);
+
+        assertEq(token.name(), "Colossus Test Token");
+        assertEq(token.symbol(), "COLT");
+        assertEq(token.decimals(), 6);
+
+        vm.prank(owner);
+        token.mint(recipient, 123_456);
+        assertEq(token.balanceOf(recipient), 123_456);
+
+        vm.expectRevert(ColossusTestToken.InvalidOwner.selector);
+        new ColossusTestToken(address(0), 6);
+    }
+
+    function test_Coverage_EMVSettlementOnUninstallWithData() public {
+        emvSettlement.onUninstall(hex"01");
+    }
+
+    function test_Coverage_AcquirerConfigBatchEmptyArrays() public {
+        uint48 acquirerId = bytesToUint48(bytes6("EMPTY1"));
+        acquirerConfig.setAcquirer(acquirerId, address(this));
+
+        uint120[] memory merchantIds = new uint120[](0);
+        address[] memory merchantAddresses = new address[](0);
+        acquirerConfig.batchSetMerchants(acquirerId, merchantIds, merchantAddresses);
+
+        uint64[] memory terminalIds = new uint64[](0);
+        address[] memory terminalAddresses = new address[](0);
+        acquirerConfig.batchSetTerminals(acquirerId, terminalIds, terminalAddresses);
+    }
+
+    function test_Coverage_EMVSettlementCompactPayloadExecutes() public {
+        bytes memory compactPayload = abi.encodePacked(
+            hex"010203", TEST_AMOUNT, hex"00000000", TEST_TERMINAL_ID, TEST_MERCHANT_ID, hex"00000000"
+        );
+        assertEq(compactPayload.length, 40);
+
+        mockERC20.mint(address(emvSettlement), 1e24);
+        uint256 merchantBalanceBefore = mockERC20.balanceOf(merchantAddress);
+        emvSettlement.execute(compactPayload);
+        assertGt(mockERC20.balanceOf(merchantAddress), merchantBalanceBefore);
+    }
+
+    function test_Coverage_EMVSettlementMalformedPaymentDistributions() public {
+        BadAcquirerConfig badConfig = new BadAcquirerConfig();
+        EMVSettlement badSettlement = new EMVSettlement(address(mockERC20), address(badConfig), 18, address(this));
+        bytes memory emvFields = _createEMVFields();
+        mockERC20.mint(address(badSettlement), 1e24);
+
+        badConfig.setMode(BadAcquirerConfig.Mode.ZeroNonMerchantFee);
+        vm.expectRevert(abi.encodeWithSelector(EMVSettlement.InvalidFee.selector, uint256(0)));
+        badSettlement.execute(emvFields);
+
+        badConfig.setMode(BadAcquirerConfig.Mode.FeesExceedAmount);
+        vm.expectRevert(EMVSettlement.BelowTransactionMinimum.selector);
+        badSettlement.execute(emvFields);
+
+        badConfig.setMode(BadAcquirerConfig.Mode.InvalidMerchantFee);
+        vm.expectRevert(EMVSettlement.InvalidMerchantFee.selector);
+        badSettlement.execute(emvFields);
+    }
+
+    function test_Coverage_EMVSettlementHarnessInvalidBCDLength() public {
+        EMVSettlementHarness harness = new EMVSettlementHarness(address(mockERC20), address(acquirerConfig), 18);
+
+        vm.expectRevert(EMVSettlement.InvalidBCDLength.selector);
+        harness.exposedExtractAmountFromBCD(hex"0000000000", 18);
+    }
+
+    function test_Coverage_EMVValidatorDirectValidationBranches() public {
+        PackedUserOperation memory op = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+
+        op.signature = abi.encodePacked(bytes32(uint256(1)), TEST_PUBKEY_X, TEST_PUBKEY_Y, TEST_SIGNATURE);
+        vm.expectRevert(EMVValidator.InvalidPublicKey.selector);
+        emvValidator.validateUserOp(_toEMVValidatorUserOp(op), bytes32(0));
+
+        op = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.validateUserOp(_toEMVValidatorUserOp(op), bytes32(0));
+
+        bytes memory wrongSelectorCallData = _encodeSimpleTransferCall();
+        bytes4 wrongSelector = bytes4(0xdeadbeef);
+        wrongSelectorCallData[0] = 0xde;
+        wrongSelectorCallData[1] = 0xad;
+        wrongSelectorCallData[2] = 0xbe;
+        wrongSelectorCallData[3] = 0xef;
+        op = _prepareEMVUserOp(wrongSelectorCallData, true);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                EMVValidator.InvalidFunctionSelector.selector, kernel.execute.selector, wrongSelector
+            )
+        );
+        emvValidator.validateUserOp(_toEMVValidatorUserOp(op), bytes32(0));
+
+        bytes memory wrongTargetCallData = abi.encodeWithSelector(
+            kernel.execute.selector,
+            ExecLib.encode(
+                CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, ExecModeSelector.wrap(0x00), ExecModePayload.wrap(0x00)
+            ),
+            abi.encodePacked(
+                address(mockERC20), abi.encodeWithSelector(emvSettlement.execute.selector, _createEMVFields())
+            )
+        );
+        op = _prepareEMVUserOp(wrongTargetCallData, true);
+        vm.expectRevert(
+            abi.encodeWithSelector(EMVValidator.InvalidTarget.selector, address(emvSettlement), address(mockERC20))
+        );
+        emvValidator.validateUserOp(_toEMVValidatorUserOp(op), bytes32(0));
+    }
+
+    function test_Coverage_EMVValidatorViewsAndERC1271Branches() public {
+        bytes32 keyHash = _testKeyHash();
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.getExpectedATC(address(this), keyHash);
+
+        assertFalse(emvValidator.isUnpredictableNumberUsed(address(this), bytes4(hex"12345678")));
+
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        bytes memory invalidKeyHashSig =
+            abi.encodePacked(bytes32(uint256(1)), TEST_PUBKEY_X, TEST_PUBKEY_Y, TEST_SIGNATURE);
+        assertEq(
+            emvValidator.isValidSignatureWithSender(address(this), _signedPayloadHash(), invalidKeyHashSig),
+            ERC1271_INVALID
+        );
+
+        bytes32 otherPubkeyX = bytes32(uint256(0x1234));
+        bytes32 otherPubkeyY = bytes32(uint256(0x5678));
+        bytes32 otherKeyHash = emvValidator.computeKeyHash(otherPubkeyX, otherPubkeyY);
+        bytes memory unregisteredKeySig = abi.encodePacked(otherKeyHash, otherPubkeyX, otherPubkeyY, TEST_SIGNATURE);
+        bytes32 signedPayloadHash = _signedPayloadHash();
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.isValidSignatureWithSender(address(this), signedPayloadHash, unregisteredKeySig);
+    }
+
+    function test_Coverage_EMVValidatorHarnessInternalPaths() public {
+        EMVValidatorHarness harness = new EMVValidatorHarness(address(emvSettlement), kernel.execute.selector);
+        bytes memory emvFields = _createEMVFields();
+        bytes32 keyHash = _testKeyHash();
+
+        harness.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        assertEq(harness.exposedExtractUnpredictableNumber(emvFields), bytes4(hex"12345678"));
+        assertEq(harness.exposedExtractATC(emvFields), bytes2(hex"0000"));
+        assertEq(harness.exposedExtractCurrency(emvFields), bytes2(hex"0840"));
+
+        (bytes32 decodedKeyHash, bytes32 decodedPubkeyX, bytes32 decodedPubkeyY, bytes32 decodedR, bytes32 decodedS) =
+            harness.exposedDecodeEMVSignature(_createEMVSignature());
+        assertEq(decodedKeyHash, keyHash);
+        assertEq(decodedPubkeyX, TEST_PUBKEY_X);
+        assertEq(decodedPubkeyY, TEST_PUBKEY_Y);
+        assertEq(abi.encodePacked(decodedR, decodedS), TEST_SIGNATURE);
+
+        (bytes4 unpredictableNumber, uint256 currentATC) =
+            harness.exposedValidateReplayProtection(emvFields, address(this), keyHash);
+        assertEq(unpredictableNumber, bytes4(hex"12345678"));
+        assertEq(currentATC, 0);
+
+        bytes memory shortTargetCallData =
+            abi.encodeWithSelector(kernel.execute.selector, ExecMode.wrap(bytes32(0)), bytes(""));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidTarget.selector, address(emvSettlement), address(0)));
+        harness.exposedValidateTargetAndSelector(shortTargetCallData);
+
+        uint256 keyInitialized = 1 << 255;
+        vm.store(
+            address(harness),
+            _keyATCStateSlot(address(this), keyHash),
+            bytes32(keyInitialized | (uint256(type(uint16).max) + 1))
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.ATCExhausted.selector, keyHash));
+        harness.exposedValidateReplayProtection(emvFields, address(this), keyHash);
+
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.ATCExhausted.selector, keyHash));
+        harness.exposedUpdateReplayProtectionAndATC(keyHash, bytes4(hex"12345678"), type(uint16).max);
     }
 
     function test_GetRegisteredKeyHash() public whenInitialized {
