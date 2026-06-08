@@ -85,6 +85,7 @@ contract EMVValidator is IValidator {
 
     event EMVValidatorInstalled(address indexed account, uint16 atc, bytes32 pubkeyX, bytes32 pubkeyY);
     event EMVCardFrozen(address indexed account, bytes32 indexed keyHash);
+    event EMVCardUnfrozen(address indexed account, bytes32 indexed keyHash);
     event EMVCardRevoked(address indexed account, bytes32 indexed keyHash);
 
     // ========== CONSTRUCTOR ==========
@@ -269,6 +270,16 @@ contract EMVValidator is IValidator {
 
         card.frozen = true;
         emit EMVCardFrozen(msg.sender, keyHash);
+    }
+
+    function unfreezeCard(bytes32 keyHash) external {
+        CardState storage card = emvValidatorStorage[msg.sender].cards[keyHash];
+        if (!card.initialized) {
+            revert PublicKeyNotRegistered();
+        }
+
+        card.frozen = false;
+        emit EMVCardUnfrozen(msg.sender, keyHash);
     }
 
     function revokeCard(bytes32 keyHash) external {
