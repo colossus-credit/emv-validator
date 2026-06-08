@@ -25,6 +25,8 @@ contract EMVValidatorTest is KernelTestBase {
     event ReplayProtectionUpdated(
         address indexed kernel, bytes32 indexed keyHash, bytes4 unpredictableNumber, uint256 newATC
     );
+    event EMVCardFrozen(address indexed account, bytes32 indexed keyHash);
+    event EMVCardRevoked(address indexed account, bytes32 indexed keyHash);
     event EMVTransferExecuted(
         address indexed from,
         address indexed to,
@@ -1548,6 +1550,93 @@ contract EMVValidatorTest is KernelTestBase {
         assertTrue(emvValidator.isPublicKeyRegistered(address(this), secondKeyHash));
         assertEq(emvValidator.getExpectedATC(address(this), _testKeyHash()), 0);
         assertEq(emvValidator.getExpectedATC(address(this), secondKeyHash), 7);
+    }
+
+    function test_FreezeCardBlocksUserOpsAndEmits() public whenInitialized {
+        _installEMVValidator();
+
+        bytes32 keyHash = _testKeyHash();
+        vm.expectEmit(true, true, false, true, address(emvValidator));
+        emit EMVCardFrozen(address(kernel), keyHash);
+        vm.prank(address(kernel));
+        emvValidator.freezeCard(keyHash);
+
+        assertTrue(emvValidator.isPublicKeyRegistered(address(kernel), keyHash));
+        assertTrue(emvValidator.isCardFrozen(address(kernel), keyHash));
+
+        (uint256 expectedATC, bool initialized, bool frozen) = emvValidator.getCardState(address(kernel), keyHash);
+        assertEq(expectedATC, 0);
+        assertTrue(initialized);
+        assertTrue(frozen);
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+
+        assertEq(emvValidator.getExpectedATC(address(kernel), keyHash), 0);
+        assertFalse(emvValidator.isUnpredictableNumberUsed(address(kernel), bytes4(TEST_UNPREDICTABLE_NUMBER)));
+    }
+
+    function test_FreezeCardBlocksERC1271() public {
+        bytes32 keyHash = _testKeyHash();
+
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        emvValidator.freezeCard(keyHash);
+
+        bytes32 signedPayloadHash = _signedPayloadHash();
+        bytes memory signature = _createEMVSignature();
+
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.CardFrozen.selector, keyHash));
+        emvValidator.isValidSignatureWithSender(address(this), signedPayloadHash, signature);
+    }
+
+    function test_RevokeCardRemovesRegistrationAndEmits() public whenInitialized {
+        _installEMVValidator();
+
+        bytes32 keyHash = _testKeyHash();
+        vm.expectEmit(true, true, false, true, address(emvValidator));
+        emit EMVCardRevoked(address(kernel), keyHash);
+        vm.prank(address(kernel));
+        emvValidator.revokeCard(keyHash);
+
+        assertFalse(emvValidator.isPublicKeyRegistered(address(kernel), keyHash));
+        assertFalse(emvValidator.isCardFrozen(address(kernel), keyHash));
+
+        (uint256 expectedATC, bool initialized) = emvValidator.getEMVStorage(address(kernel), keyHash);
+        assertEq(expectedATC, 0);
+        assertFalse(initialized);
+
+        (uint256 cardATC, bool cardInitialized, bool frozen) = emvValidator.getCardState(address(kernel), keyHash);
+        assertEq(cardATC, 0);
+        assertFalse(cardInitialized);
+        assertFalse(frozen);
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.getExpectedATC(address(kernel), keyHash);
+
+        mockERC20.transfer(address(kernel), 1e20);
+        vm.deal(address(kernel), 1e18);
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
+
+        vm.expectRevert();
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_FreezeAndRevokeRequireRegisteredCard() public {
+        bytes32 keyHash = _testKeyHash();
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.freezeCard(keyHash);
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.revokeCard(keyHash);
     }
 
     function test_InvalidSender() public {
