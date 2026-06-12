@@ -162,6 +162,13 @@ contract EMVSettlement is Ownable {
             return (14, 34, 42, 57);
         }
 
+        // 61-byte ATC(2) || PDOL(59) message (matches EMVValidator):
+        //   9F02 amount @ 2, 9F1C terminal @ 26, 9F16 merchant @ 36, 9F01 acquirer @ 51.
+        // acquirerOffset is non-zero, so the real 9F01 is read (no hardcoded fallback).
+        if (emvData.length == 61) {
+            return (2, 26, 36, 51);
+        }
+
         revert InvalidBCDLength();
     }
 

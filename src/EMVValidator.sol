@@ -49,7 +49,12 @@ contract EMVValidator is IValidator {
     // ========== STORAGE ==========
 
     uint256 private constant ATC_MAX = type(uint16).max;
-    uint256 private constant EMV_FIELDS_LENGTH = 63;
+    // The signed message is exactly what the JavaCard applet signs at GPO:
+    // ATC(2) || PDOL(59) = 61 bytes (see emv-card-sim PaymentApplication.java
+    // generateEcdsaAtGpo + profiles/default.yaml canonical PDOL). The contract
+    // hashes the whole message with SHA-256 and P256-verifies; replay fields are
+    // read from fixed offsets within it.
+    uint256 private constant EMV_FIELDS_LENGTH = 61;
 
     struct CardState {
         uint192 atc;
@@ -411,8 +416,14 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
+        // Offsets within the 61-byte ATC(2) || PDOL(59) signed message:
+        //   ATC      @ 0  (len 2)
+        //   9F02 amt @ 2  (len 6)
+        //   5F2A cur @ 16 (len 2)  -- PDOL offset 14
+        //   9F37 UN  @ 22 (len 4)  -- PDOL offset 20
+        // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset)
         if (emvFields.length == EMV_FIELDS_LENGTH) {
-            return (8, 12, 14, 20);
+            return (22, 0, 2, 16);
         }
 
         revert InvalidSignatureLength(emvFields.length);
@@ -430,7 +441,8 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract ATC (2 bytes) from packed EMV fields - Assembly optimized
-     * Position 12-13 in the 63-byte validator payload
+     * Offset 0 of the 61-byte ATC(2)||PDOL(59) message. This is the pre-increment
+     * ATC the applet signs at GPO (N); replay state tracks N then advances to N+1.
      */
     function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
@@ -441,7 +453,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract currency (2 bytes) from packed EMV fields - Assembly optimized
-     * Position 20-21 in the 63-byte validator payload
+     * 5F2A at offset 16 of the 61-byte message (PDOL offset 14).
      */
     function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (,,, uint256 currencyOffset) = _emvFieldOffsets(emvFields);
@@ -542,6 +554,9 @@ contract EMVValidator is IValidator {
         view
         returns (bool)
     {
+        // emvFields IS the applet's signed message: ATC(2) || PDOL(59) = 61 bytes,
+        // with no TLV framing. The applet signs SHA-256(message) with ECDSA-P256
+        // (ALG_ECDSA_SHA_256), emitting raw r||s. Hash the whole message and verify.
         bytes32 messageHash = sha256(emvFields);
 
         // Verify ECDSA signature using P256 library
