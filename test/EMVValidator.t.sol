@@ -71,8 +71,8 @@ contract EMVValidatorTest is KernelTestBase {
 
     // Valid P-256 ECDSA signature (r||s, 64 bytes), low-s normalized.
     // Signed data: SHA-256(61-byte ATC(2)||PDOL(59) message) under the test key above.
-    bytes constant TEST_SIGNATURE = hex"5e7a4aa7863b09bf660c4ff351a152effad74d7ff4e13234176a22a96bb042de" // r
-        hex"0e0fd5adf585672a417179aeeae0fa22cf46752538f09017bc584fc7f3057297"; // s
+    bytes constant TEST_SIGNATURE = hex"e926d463e93722271c26d42c3aad34b889c82e4571c538418854e4397e9011a2" // r
+        hex"62f51ad5bbde9bdc78707ea90e2f69d1dd714777d0eb9b41a63bedb223e678ea"; // s
 
     function _testKeyHash() internal pure returns (bytes32) {
         return keccak256(abi.encode(TEST_PUBKEY_X, TEST_PUBKEY_Y));
@@ -195,24 +195,24 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function _createEMVFields() internal pure returns (bytes memory) {
-        // Canonical 61-byte applet message: ATC(2) || PDOL(59), the exact bytes
-        // emv-card-sim signs at GPO (PaymentApplication.generateEcdsaAtGpo).
-        // PDOL order: 9F02 9F03 9F1A 5F2A 9A 9C 9F37 9F1C 9F15 9F16 9F01 9F21 5F36.
+        // 61-byte applet message: ATC(2) || PDOL(59), SLICE-FROM-FRONT layout
+        // (PaymentApplication.generateEcdsaAtGpo). The 9 contract-validated fields
+        // are front-loaded; the advisory tail (country/date/MCC/time) follows.
         return abi.encodePacked(
-            TEST_ATC, // 9F36 ATC (2)         off 0
-            TEST_AMOUNT, // 9F02 Amount Authorised (6)  off 2
-            hex"000000000000", // 9F03 Amount Other (6)  off 8
-            hex"0840", // 9F1A Terminal Country Code (2) off 14
-            TEST_CURRENCY, // 5F2A Transaction Currency Code (2) off 16
-            TEST_DATE, // 9A Transaction Date (3)  off 18
-            TEST_TXN_TYPE, // 9C Transaction Type (1)  off 21
-            TEST_UNPREDICTABLE_NUMBER, // 9F37 UN (4)  off 22
-            TEST_TERMINAL_ID, // 9F1C Terminal ID (8)  off 26
-            hex"5999", // 9F15 Merchant Category Code (2) off 34
-            TEST_MERCHANT_ID, // 9F16 Merchant ID (15)  off 36
-            TEST_ACQUIRER_ID, // 9F01 Acquirer ID (6)  off 51
-            hex"120000", // 9F21 Transaction Time (3)  off 57
-            hex"02" // 5F36 Transaction Currency Exponent (1)  off 60
+            TEST_ATC, // 9F36 ATC (2)                       off 0
+            TEST_UNPREDICTABLE_NUMBER, // 9F37 UN (4)        off 2
+            TEST_TXN_TYPE, // 9C Transaction Type (1)        off 6
+            TEST_CURRENCY, // 5F2A Currency (2)              off 7
+            TEST_AMOUNT, // 9F02 Amount Authorised (6)       off 9
+            hex"000000000000", // 9F03 Amount Other (6)      off 15
+            hex"02", // 5F36 Currency Exponent (1)           off 21
+            TEST_MERCHANT_ID, // 9F16 Merchant ID (15)       off 22
+            TEST_TERMINAL_ID, // 9F1C Terminal ID (8)        off 37
+            TEST_ACQUIRER_ID, // 9F01 Acquirer ID (6)        off 45
+            hex"0840", // 9F1A Terminal Country Code (2)     off 51
+            TEST_DATE, // 9A Transaction Date (3)            off 53
+            hex"5999", // 9F15 Merchant Category Code (2)    off 56
+            hex"120000" // 9F21 Transaction Time (3)         off 58
         );
     }
 
@@ -448,10 +448,10 @@ contract EMVValidatorTest is KernelTestBase {
         // Every byte of the 61-byte ATC||PDOL message is signed, so tampering any
         // field invalidates the payload. Offsets per the canonical PDOL layout.
         _expectInvalidEMVPayload(_createEMVFieldsWithByte(0, bytes1(0x99))); // ATC
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(2, bytes1(0x24))); // 9F02 Amount
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(18, bytes1(0x24))); // 9A Date
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(34, bytes1(0x80))); // 9F15 MCC
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(60, bytes1(0x01))); // 5F36 Currency Exponent
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(2, bytes1(0x24))); // 9F37 UN
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(9, bytes1(0x24))); // 9F02 Amount
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(22, bytes1(0x80))); // 9F16 Merchant Id
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(58, bytes1(0x01))); // 9F21 Transaction Time
     }
 
     function test_EMVValidatorRejectsCompactPayload() public whenInitialized {
@@ -493,9 +493,10 @@ contract EMVValidatorTest is KernelTestBase {
 
         bytes memory reroutedFields = _createEMVFields();
         // New 61-byte layout offsets: 9F1C Terminal @ 26, 9F16 Merchant @ 36, 9F01 Acquirer @ 51.
-        reroutedFields = _replaceEMVField(reroutedFields, 26, abi.encodePacked(bytes8("BADTERM1")));
-        reroutedFields = _replaceEMVField(reroutedFields, 36, abi.encodePacked(bytes15("BADMERCHANT0001")));
-        reroutedFields = _replaceEMVField(reroutedFields, 51, abi.encodePacked(bytes6("BADACQ")));
+        // Slice-from-front settlement offsets: 9F16 Merchant @ 22, 9F1C Terminal @ 37, 9F01 Acquirer @ 45.
+        reroutedFields = _replaceEMVField(reroutedFields, 22, abi.encodePacked(bytes15("BADMERCHANT0001")));
+        reroutedFields = _replaceEMVField(reroutedFields, 37, abi.encodePacked(bytes8("BADTERM1")));
+        reroutedFields = _replaceEMVField(reroutedFields, 45, abi.encodePacked(bytes6("BADACQ")));
 
         _expectInvalidEMVPayload(reroutedFields);
         assertEq(mockERC20.balanceOf(attackerMerchant), 0, "Rerouted merchant should not receive funds");

@@ -416,14 +416,15 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
-        // Offsets within the 61-byte ATC(2) || PDOL(59) signed message:
-        //   ATC      @ 0  (len 2)
-        //   9F02 amt @ 2  (len 6)
-        //   5F2A cur @ 16 (len 2)  -- PDOL offset 14
-        //   9F37 UN  @ 22 (len 4)  -- PDOL offset 20
+        // Offsets within the 61-byte ATC(2) || PDOL(59) signed message
+        // (slice-from-front layout: contract-validated fields are front-loaded):
+        //   ATC      @ 0 (len 2)
+        //   9F37 UN  @ 2 (len 4)
+        //   5F2A cur @ 7 (len 2)
+        //   9F02 amt @ 9 (len 6)
         // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset)
         if (emvFields.length == EMV_FIELDS_LENGTH) {
-            return (22, 0, 2, 16);
+            return (2, 0, 9, 7);
         }
 
         revert InvalidSignatureLength(emvFields.length);
