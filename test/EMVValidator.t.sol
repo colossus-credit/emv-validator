@@ -7,6 +7,7 @@ import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
+import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
 
@@ -69,10 +70,10 @@ contract EMVValidatorTest is KernelTestBase {
         return uint120(bytes15(b));
     }
 
-    // Valid P-256 ECDSA signature (r||s, 64 bytes)
-    // Signed data: SHA-256(63-byte packed EMV validator payload)
-    bytes constant TEST_SIGNATURE = hex"097e0f480a8f104de2da4cf6330bdc80e037e960a962320633d50140c6a7041a" // r
-        hex"60c07436cd16d4d1073aff90d4a839cc053d3b953e8b87b1e76b96d4b7321dea"; // s
+    // Valid P-256 ECDSA signature (r||s, 64 bytes), low-s normalized.
+    // Signed data: SHA-256(61-byte ATC(2)||PDOL(59) message) under the test key above.
+    bytes constant TEST_SIGNATURE = hex"e926d463e93722271c26d42c3aad34b889c82e4571c538418854e4397e9011a2" // r
+        hex"62f51ad5bbde9bdc78707ea90e2f69d1dd714777d0eb9b41a63bedb223e678ea"; // s
 
     function _testKeyHash() internal pure returns (bytes32) {
         return keccak256(abi.encode(TEST_PUBKEY_X, TEST_PUBKEY_Y));
@@ -195,20 +196,24 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function _createEMVFields() internal pure returns (bytes memory) {
-        // Create just the 63-byte EMV transaction fields
+        // 61-byte applet message: ATC(2) || PDOL(59), SLICE-FROM-FRONT layout
+        // (PaymentApplication.generateEcdsaAtGpo). The 9 contract-validated fields
+        // are front-loaded; the advisory tail (country/date/MCC/time) follows.
         return abi.encodePacked(
-            TEST_ARQC, // 8 bytes
-            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
-            TEST_ATC, // 2 bytes
-            TEST_AMOUNT, // 6 bytes
-            TEST_CURRENCY, // 2 bytes
-            TEST_DATE, // 3 bytes
-            TEST_TXN_TYPE, // 1 byte
-            TEST_TVR, // 5 bytes
-            TEST_CVM_RESULTS, // 3 bytes
-            TEST_TERMINAL_ID, // 8 bytes
-            TEST_MERCHANT_ID, // 15 bytes
-            TEST_ACQUIRER_ID // 6 bytes
+            TEST_ATC, // 9F36 ATC (2)                       off 0
+            TEST_UNPREDICTABLE_NUMBER, // 9F37 UN (4)        off 2
+            TEST_TXN_TYPE, // 9C Transaction Type (1)        off 6
+            TEST_CURRENCY, // 5F2A Currency (2)              off 7
+            TEST_AMOUNT, // 9F02 Amount Authorised (6)       off 9
+            hex"000000000000", // 9F03 Amount Other (6)      off 15
+            hex"02", // 5F36 Currency Exponent (1)           off 21
+            TEST_MERCHANT_ID, // 9F16 Merchant ID (15)       off 22
+            TEST_TERMINAL_ID, // 9F1C Terminal ID (8)        off 37
+            TEST_ACQUIRER_ID, // 9F01 Acquirer ID (6)        off 45
+            hex"0840", // 9F1A Terminal Country Code (2)     off 51
+            TEST_DATE, // 9A Transaction Date (3)            off 53
+            hex"5999", // 9F15 Merchant Category Code (2)    off 56
+            hex"120000" // 9F21 Transaction Time (3)         off 58
         );
     }
 
@@ -435,17 +440,19 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
     }
 
-    function test_EMVSignatureBindsARQCDateTxnTypeTVRAndCVMResults() public whenInitialized {
+    function test_EMVSignatureBindsMessageFields() public whenInitialized {
         _installEMVValidator();
 
         mockERC20.transfer(address(kernel), 1e21);
         vm.deal(address(kernel), 1e18);
 
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(0, bytes1(0x99))); // ARQC
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(22, bytes1(0x24))); // Date
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(25, bytes1(0x01))); // Transaction type
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(26, bytes1(0x80))); // TVR
-        _expectInvalidEMVPayload(_createEMVFieldsWithByte(31, bytes1(0x01))); // CVM results
+        // Every byte of the 61-byte ATC||PDOL message is signed, so tampering any
+        // field invalidates the payload. Offsets per the canonical PDOL layout.
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(0, bytes1(0x99))); // ATC
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(2, bytes1(0x24))); // 9F37 UN
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(9, bytes1(0x24))); // 9F02 Amount
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(22, bytes1(0x80))); // 9F16 Merchant Id
+        _expectInvalidEMVPayload(_createEMVFieldsWithByte(58, bytes1(0x01))); // 9F21 Transaction Time
     }
 
     function test_EMVValidatorRejectsCompactPayload() public whenInitialized {
@@ -486,12 +493,39 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setTerminal(attackerAcquirerId, attackerTerminalId, attackerFeeRecipient);
 
         bytes memory reroutedFields = _createEMVFields();
-        reroutedFields = _replaceEMVField(reroutedFields, 34, abi.encodePacked(bytes8("BADTERM1")));
-        reroutedFields = _replaceEMVField(reroutedFields, 42, abi.encodePacked(bytes15("BADMERCHANT0001")));
-        reroutedFields = _replaceEMVField(reroutedFields, 57, abi.encodePacked(bytes6("BADACQ")));
+        // New 61-byte layout offsets: 9F1C Terminal @ 26, 9F16 Merchant @ 36, 9F01 Acquirer @ 51.
+        // Slice-from-front settlement offsets: 9F16 Merchant @ 22, 9F1C Terminal @ 37, 9F01 Acquirer @ 45.
+        reroutedFields = _replaceEMVField(reroutedFields, 22, abi.encodePacked(bytes15("BADMERCHANT0001")));
+        reroutedFields = _replaceEMVField(reroutedFields, 37, abi.encodePacked(bytes8("BADTERM1")));
+        reroutedFields = _replaceEMVField(reroutedFields, 45, abi.encodePacked(bytes6("BADACQ")));
 
         _expectInvalidEMVPayload(reroutedFields);
         assertEq(mockERC20.balanceOf(attackerMerchant), 0, "Rerouted merchant should not receive funds");
+    }
+
+    function test_EMVValidatorEnforcesAuxiliarySignedFields() public whenInitialized {
+        _installEMVValidator();
+
+        // validateUserOp only reads userOp.callData before _validateAuxiliaryFields runs (ahead of
+        // signature verification), so a minimal callData-only op reaches the auxiliary checks. Calling
+        // the validator directly (not via the EntryPoint) lets the precise revert propagate unwrapped.
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+
+        // 9C Transaction Type @ 6 — only purchase (0x00) is accepted.
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(6, bytes1(0x09)));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.UnsupportedTransactionType.selector, uint8(0x09)));
+        emvValidator.validateUserOp(op, bytes32(0));
+
+        // 9F03 Amount, Other @ 15 — must be zero (no secondary amount / cashback).
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(15, bytes1(0x01)));
+        vm.expectRevert(EMVValidator.UnexpectedAmountOther.selector);
+        emvValidator.validateUserOp(op, bytes32(0));
+
+        // 5F36 Transaction Currency Exponent @ 21 — must equal the supported minor-unit exponent (2).
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(21, bytes1(0x03)));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidCurrencyExponent.selector, uint8(0x03)));
+        emvValidator.validateUserOp(op, bytes32(0));
     }
 
     function test_InstallEMVAsValidatorAndExecutor() public whenInitialized {
