@@ -56,6 +56,29 @@ contract EMVValidator is IValidator {
     // read from fixed offsets within it.
     uint256 private constant EMV_FIELDS_LENGTH = 61;
 
+    // Offsets within the 61-byte ATC(2) || PDOL(59) slice-from-front message. The P-256 signature
+    // covers all 61 bytes; this records which signed fields the contracts also *enforce*, and where:
+    //   off  len  tag    field                          enforced by
+    //   0    2    9F36   ATC (card-prefixed)            EMVValidator (replay)
+    //   2    4    9F37   Unpredictable Number           EMVValidator (replay)
+    //   6    1    9C     Transaction Type               EMVValidator (_validateAuxiliaryFields)
+    //   7    2    5F2A   Transaction Currency Code      EMVValidator (_validateCurrencyCode)
+    //   9    6    9F02   Amount, Authorised             EMVSettlement (transfer amount)
+    //   15   6    9F03   Amount, Other                  EMVValidator (_validateAuxiliaryFields)
+    //   21   1    5F36   Transaction Currency Exponent  EMVValidator (_validateAuxiliaryFields)
+    //   22   15   9F16   Merchant Identifier            EMVSettlement (routing)
+    //   37   8    9F1C   Terminal Identification        EMVSettlement (routing)
+    //   45   6    9F01   Acquirer Identifier            EMVSettlement (routing)
+    //   51   2    9F1A   Terminal Country Code          advisory (signed only)
+    //   53   3    9A     Transaction Date               advisory (signed only)
+    //   56   2    9F15   Merchant Category Code         advisory (signed only)
+    //   58   3    9F21   Transaction Time               advisory (signed only)
+    uint256 private constant TXN_TYPE_OFFSET = 6;
+    uint256 private constant AMOUNT_OTHER_OFFSET = 15;
+    uint256 private constant CURRENCY_EXP_OFFSET = 21;
+    uint8 private constant SUPPORTED_TXN_TYPE = 0x00; // Purchase / goods & services
+    uint8 private constant SUPPORTED_CURRENCY_EXPONENT = 2; // minor units for USD (840) / USN (997)
+
     struct CardState {
         uint192 atc;
         bool initialized;
@@ -76,6 +99,9 @@ contract EMVValidator is IValidator {
     error UnpredictableNumberAlreadyUsed(bytes4 unpredictableNumber);
     error InvalidATCSequence(uint16 expected, uint16 received);
     error InvalidCurrencyCode(uint16 currency);
+    error UnsupportedTransactionType(uint8 txnType);
+    error UnexpectedAmountOther();
+    error InvalidCurrencyExponent(uint8 exponent);
     error InvalidConfig();
     error InvalidTarget(address expected, address actual);
     error InvalidFunctionSelector(bytes4 expected, bytes4 actual);
@@ -191,6 +217,7 @@ contract EMVValidator is IValidator {
         // Gas-optimized validation using calldata extraction instead of full memory expansion
         // Validate currency code from EMV fields
         _validateCurrencyCode(emvFields);
+        _validateAuxiliaryFields(emvFields);
 
         (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY, bytes32 r, bytes32 s) =
             _decodeEMVSignature(userOp.signature);
@@ -416,13 +443,11 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
-        // Offsets within the 61-byte ATC(2) || PDOL(59) signed message
-        // (slice-from-front layout: contract-validated fields are front-loaded):
-        //   ATC      @ 0 (len 2)
-        //   9F37 UN  @ 2 (len 4)
-        //   5F2A cur @ 7 (len 2)
-        //   9F02 amt @ 9 (len 6)
-        // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset)
+        // Replay/currency offsets within the 61-byte ATC(2) || PDOL(59) signed message. The full
+        // signed-field map — including the type / amount-other / currency-exponent fields enforced
+        // in _validateAuxiliaryFields and the merchant/terminal/acquirer fields EMVSettlement reads —
+        // is tabulated at the offset constants near EMV_FIELDS_LENGTH.
+        // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset) = (2, 0, 9, 7)
         if (emvFields.length == EMV_FIELDS_LENGTH) {
             return (2, 0, 9, 7);
         }
@@ -473,6 +498,31 @@ contract EMVValidator is IValidator {
         uint16 currency = uint16(currencyBytes);
         if (currency != 0x0840 && currency != 0x0997 && currency != 840 && currency != 997) {
             revert InvalidCurrencyCode(currency);
+        }
+    }
+
+    /**
+     * @dev Enforce the card-signed "validated" fields the settlement does not consume:
+     * 9C transaction type, 9F03 amount-other, 5F36 currency exponent. The P-256 signature already
+     * binds all 61 bytes; this records which signed values the contract accepts (pilot policy:
+     * purchases only, no secondary amount, USD/USN minor units). Runs before signature verification,
+     * alongside the currency check, so an unsupported field fails fast with a precise error.
+     * @param emvFields The 61-byte EMV fields calldata
+     */
+    function _validateAuxiliaryFields(bytes calldata emvFields) internal pure {
+        // 9C Transaction Type @ 6 — purchase (0x00) only.
+        uint8 txnType = uint8(emvFields[TXN_TYPE_OFFSET]);
+        if (txnType != SUPPORTED_TXN_TYPE) {
+            revert UnsupportedTransactionType(txnType);
+        }
+        // 9F03 Amount, Other @ 15 (6 bytes) — no secondary amount / cashback.
+        if (bytes6(emvFields[AMOUNT_OTHER_OFFSET:AMOUNT_OTHER_OFFSET + 6]) != bytes6(0)) {
+            revert UnexpectedAmountOther();
+        }
+        // 5F36 Transaction Currency Exponent @ 21 — minor-unit exponent for the supported currencies.
+        uint8 currencyExponent = uint8(emvFields[CURRENCY_EXP_OFFSET]);
+        if (currencyExponent != SUPPORTED_CURRENCY_EXPONENT) {
+            revert InvalidCurrencyExponent(currencyExponent);
         }
     }
 

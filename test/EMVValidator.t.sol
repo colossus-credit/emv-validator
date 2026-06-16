@@ -7,6 +7,7 @@ import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
+import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
 
@@ -500,6 +501,31 @@ contract EMVValidatorTest is KernelTestBase {
 
         _expectInvalidEMVPayload(reroutedFields);
         assertEq(mockERC20.balanceOf(attackerMerchant), 0, "Rerouted merchant should not receive funds");
+    }
+
+    function test_EMVValidatorEnforcesAuxiliarySignedFields() public whenInitialized {
+        _installEMVValidator();
+
+        // validateUserOp only reads userOp.callData before _validateAuxiliaryFields runs (ahead of
+        // signature verification), so a minimal callData-only op reaches the auxiliary checks. Calling
+        // the validator directly (not via the EntryPoint) lets the precise revert propagate unwrapped.
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+
+        // 9C Transaction Type @ 6 — only purchase (0x00) is accepted.
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(6, bytes1(0x09)));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.UnsupportedTransactionType.selector, uint8(0x09)));
+        emvValidator.validateUserOp(op, bytes32(0));
+
+        // 9F03 Amount, Other @ 15 — must be zero (no secondary amount / cashback).
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(15, bytes1(0x01)));
+        vm.expectRevert(EMVValidator.UnexpectedAmountOther.selector);
+        emvValidator.validateUserOp(op, bytes32(0));
+
+        // 5F36 Transaction Currency Exponent @ 21 — must equal the supported minor-unit exponent (2).
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(21, bytes1(0x03)));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidCurrencyExponent.selector, uint8(0x03)));
+        emvValidator.validateUserOp(op, bytes32(0));
     }
 
     function test_InstallEMVAsValidatorAndExecutor() public whenInitialized {
