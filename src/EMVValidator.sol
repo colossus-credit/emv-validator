@@ -50,14 +50,17 @@ contract EMVValidator is IValidator {
 
     uint256 private constant ATC_MAX = type(uint16).max;
     // The signed message is exactly what the JavaCard applet signs at GPO:
-    // ATC(2) || PDOL(59) = 61 bytes (see emv-card-sim PaymentApplication.java
+    // ATC(2) || PDOL(50) = 52 bytes (see emv-card-sim PaymentApplication.java
     // generateEcdsaAtGpo + profiles/default.yaml canonical PDOL). The contract
     // hashes the whole message with SHA-256 and P256-verifies; replay fields are
     // read from fixed offsets within it.
-    uint256 private constant EMV_FIELDS_LENGTH = 61;
+    uint256 private constant EMV_FIELDS_LENGTH = 52;
 
-    // Offsets within the 61-byte ATC(2) || PDOL(59) slice-from-front message. The P-256 signature
-    // covers all 61 bytes; this records which signed fields the contracts also *enforce*, and where:
+    // Offsets within the 52-byte ATC(2) || PDOL(50) slice-from-front message. The P-256 signature
+    // covers all 52 bytes; this records which signed fields the contracts also *enforce*, and where.
+    // 9F01 (acquirer) and 9F21 (time) are NOT signed: acquirer is an EMVSettlement.execute() argument
+    // (the terminal can't put a real acquirer in the GPO), and time drifts between GPO sign and host
+    // reconstruction. Their removal shifts the advisory tail (Country/Date/MCC) back by 6 bytes.
     //   off  len  tag    field                          enforced by
     //   0    2    9F36   ATC (card-prefixed)            EMVValidator (replay)
     //   2    4    9F37   Unpredictable Number           EMVValidator (replay)
@@ -68,11 +71,9 @@ contract EMVValidator is IValidator {
     //   21   1    5F36   Transaction Currency Exponent  EMVValidator (_validateAuxiliaryFields)
     //   22   15   9F16   Merchant Identifier            EMVSettlement (routing)
     //   37   8    9F1C   Terminal Identification        EMVSettlement (routing)
-    //   45   6    9F01   Acquirer Identifier            EMVSettlement (routing)
-    //   51   2    9F1A   Terminal Country Code          advisory (signed only)
-    //   53   3    9A     Transaction Date               advisory (signed only)
-    //   56   2    9F15   Merchant Category Code         advisory (signed only)
-    //   58   3    9F21   Transaction Time               advisory (signed only)
+    //   45   2    9F1A   Terminal Country Code          advisory (signed only)
+    //   47   3    9A     Transaction Date               advisory (signed only)
+    //   50   2    9F15   Merchant Category Code         advisory (signed only)
     uint256 private constant TXN_TYPE_OFFSET = 6;
     uint256 private constant AMOUNT_OTHER_OFFSET = 15;
     uint256 private constant CURRENCY_EXP_OFFSET = 21;
@@ -397,10 +398,12 @@ contract EMVValidator is IValidator {
         // Skip target(20) bytes to get to inner calldata
         uint256 innerCalldataStart = executionDataStart + 20;
 
-        // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields
-        // Skip selector(4) + offset(32) + length(32) = 68 bytes
-        uint256 emvDataStart = innerCalldataStart + 68;
-        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 36:innerCalldataStart + 68]));
+        // Inner calldata = EMVSettlement.execute(bytes emvData, uint48 acquirerId), ABI-encoded:
+        //   selector(4) + offsetToEmvData(32) + acquirerId(32) + emvDataLength(32) + emvData
+        // emvData (the card-signed message) is the dynamic first arg; acquirerId is switch-supplied
+        // and NOT part of the signed message. Skip selector(4)+offset(32)+acquirerId(32)+length(32)=100.
+        uint256 emvDataStart = innerCalldataStart + 100;
+        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 68:innerCalldataStart + 100]));
 
         return callData[emvDataStart:emvDataStart + emvDataLength];
     }

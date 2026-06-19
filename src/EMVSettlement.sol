@@ -103,18 +103,19 @@ contract EMVSettlement is Ownable {
 
     /**
      * @dev Main entry point: Execute EMV-based ERC20 transfer using validated EMV data
-     * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
+     * @param emvData Packed EMV transaction data (the card-signed message, same bytes the UserOp
+     *        signature covers)
+     * @param acquirerId Acquirer routing ID. Supplied by the switch (the acquiring side), NOT
+     *        card-signed: the terminal can't put a real acquirer in the GPO PDOL, so 9F01 was
+     *        dropped from the signed message. A wrong value can only point at owner-registered
+     *        config (merchant/terminal lookups are namespaced under it), so it can't misroute funds.
      */
-    function execute(bytes calldata emvData) external payable {
-        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset) =
-            _emvSettlementOffsets(emvData);
+    function execute(bytes calldata emvData, uint48 acquirerId) external payable {
+        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
 
         bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
         uint64 terminalId = uint64(bytes8(emvData[terminalOffset:terminalOffset + 8]));
         uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
-        uint48 acquirerId = acquirerOffset == 0
-            ? uint48(0x414351554952)  // "ACQUIR" in compact 40-byte payloads.
-            : uint48(bytes6(emvData[acquirerOffset:acquirerOffset + 6]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -152,21 +153,27 @@ contract EMVSettlement is Ownable {
     function _emvSettlementOffsets(bytes calldata emvData)
         internal
         pure
-        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset)
+        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset)
     {
-        if (emvData.length == 40) {
-            return (3, 13, 21, 0);
+        // 52-byte ATC(2) || PDOL(50) slice-from-front message — current layout. 9F01 (acquirer) and
+        // 9F21 (time) were dropped from the signed PDOL: acquirer is an execute() argument now, and
+        // time drifts between GPO signing and host reconstruction. The validated front block is
+        // unchanged: 9F02 amount @ 9, 9F16 merchant @ 22, 9F1C terminal @ 37.
+        if (emvData.length == 52) {
+            return (9, 37, 22);
+        }
+
+        // Legacy 61-byte (9F01 still present but ignored — acquirer comes from the arg) and 40-byte.
+        if (emvData.length == 61) {
+            return (9, 37, 22);
         }
 
         if (emvData.length == 63) {
-            return (14, 34, 42, 57);
+            return (14, 34, 42);
         }
 
-        // 61-byte ATC(2) || PDOL(59) message (slice-from-front, matches EMVValidator):
-        //   9F02 amount @ 9, 9F16 merchant @ 22, 9F1C terminal @ 37, 9F01 acquirer @ 45.
-        // acquirerOffset is non-zero, so the real 9F01 is read (no hardcoded fallback).
-        if (emvData.length == 61) {
-            return (9, 37, 22, 45);
+        if (emvData.length == 40) {
+            return (3, 13, 21);
         }
 
         revert InvalidBCDLength();
