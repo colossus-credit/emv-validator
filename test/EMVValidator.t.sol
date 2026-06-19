@@ -72,7 +72,7 @@ contract EMVValidatorTest is KernelTestBase {
 
     // Valid P-256 ECDSA signature (r||s, 64 bytes), low-s normalized.
     // Signed data: SHA-256(52-byte ATC(2)||PDOL(50) message) under the test key above.
-    // Regenerate with: node script/gen-sig-52.js
+    // Regenerate with: node script/generate-p256-test-sig.js
     bytes constant TEST_SIGNATURE = hex"e6a9a4f20d16a123252c98913b9f7cd740d20f4acdbb2d70d9edb86a70602797" // r
         hex"2502bc1502afe1072734ac5a0f16483bbf9f123c3b213699a8ddad289a3314d7"; // s
 
