@@ -34,9 +34,7 @@ contract AcquirerConfig is Ownable {
     // Mappings
     mapping(uint48 => address) public acquirerAddresses; // Acquirer ID (6 bytes -> uint48) to authorized address
     mapping(uint48 => AcquirerData) private acquirerData; // Acquirer ID (6 bytes -> uint48) to configuration data
-    // Merchant ID (15 bytes -> uint120) to its acquirer (global, 1:1; written by setMerchant). The
-    // card-signed merchant routes the transaction: EMVSettlement derives the acquirer from this map,
-    // so the switch never supplies (and cannot influence) routing.
+    // merchant (15B -> uint120) -> acquirer; global 1:1, set in setMerchant. Routing derives from this.
     mapping(uint120 => uint48) public merchantAcquirer;
 
     // Network configuration (global, owner-controlled)
@@ -181,10 +179,7 @@ contract AcquirerConfig is Ownable {
     {
         if (merchantId == 0) revert InvalidMerchantId();
 
-        // Maintain the global merchant -> acquirer binding used for on-chain routing. A merchant maps
-        // to exactly one acquirer: reject if it's already owned by a different one (first-come, so
-        // globally-unique merchant IDs are enforced on-chain). The same acquirer may freely update;
-        // removing (address(0)) frees the binding if the caller owns it.
+        // Bind merchant -> acquirer (global 1:1); reject if owned by another. address(0) frees it.
         if (merchantAddress == address(0)) {
             if (merchantAcquirer[merchantId] == acquirerId) delete merchantAcquirer[merchantId];
         } else {
@@ -423,8 +418,7 @@ contract AcquirerConfig is Ownable {
         external
         returns (FeeRecipient[] memory feeRecipients)
     {
-        // Derive the acquirer from the card-signed merchant ID (1:1, set via setMerchant). The switch
-        // never supplies it, so a compromised/buggy relay cannot influence routing.
+        // Acquirer is derived from the card-signed merchant, never supplied by the caller.
         uint48 acquirerId = merchantAcquirer[merchantId];
         if (acquirerId == 0 || acquirerAddresses[acquirerId] == address(0)) {
             revert UnknownMerchant(merchantId);
@@ -439,9 +433,7 @@ contract AcquirerConfig is Ownable {
         address _interchangeFeeRecipient = interchangeFeeRecipient;
         address _networkFeeRecipient = networkFeeRecipient;
 
-        // The merchant MUST have a payout address — fail loud (no silent fallback to the acquirer,
-        // which would quietly divert the merchant's funds). merchantAcquirer and the address are set
-        // together in setMerchant, so a bound merchant always has one.
+        // Require a merchant payout address; no silent fallback to the acquirer.
         address merchantAddress = acquirerData[acquirerId].merchants[merchantId];
         if (merchantAddress == address(0)) {
             revert UnknownMerchant(merchantId);

@@ -102,10 +102,9 @@ contract EMVSettlement is Ownable {
     // ========== SETTLEMENT FUNCTIONS ==========
 
     /**
-     * @dev Main entry point: Execute EMV-based ERC20 transfer using validated EMV data
-     * @param emvData Packed EMV transaction data (the card-signed message, same bytes the UserOp
-     *        signature covers). The acquirer is NOT in here and is NOT supplied by the caller — it is
-     *        derived on-chain from the card-signed merchant ID, so the relay cannot influence routing.
+     * @dev Execute the ERC20 transfer for a validated EMV transaction. The acquirer is derived
+     *      on-chain from the card-signed merchant ID, not passed in.
+     * @param emvData The card-signed message (the bytes the UserOp signature covers).
      */
     function execute(bytes calldata emvData) external payable {
         (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
