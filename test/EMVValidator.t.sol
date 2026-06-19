@@ -1850,9 +1850,7 @@ contract EMVValidatorTest is KernelTestBase {
             ExecLib.encode(
                 CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, ExecModeSelector.wrap(0x00), ExecModePayload.wrap(0x00)
             ),
-            abi.encodePacked(
-                address(emvSettlement), abi.encodeWithSelector(emvSettlement.execute.selector, emvFields)
-            )
+            abi.encodePacked(address(emvSettlement), abi.encodeWithSelector(emvSettlement.execute.selector, emvFields))
         );
 
         PackedUserOperation[] memory emvOps = new PackedUserOperation[](1);
