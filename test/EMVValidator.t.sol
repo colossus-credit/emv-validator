@@ -267,9 +267,8 @@ contract EMVValidatorTest is KernelTestBase {
         );
 
         // Then execute the EMV transfer
-        bytes memory emvTransferCall = abi.encodeWithSelector(
-            emvSettlement.execute.selector, _createEMVTransactionData(), bytesToUint48(bytes6(TEST_ACQUIRER_ID))
-        );
+        bytes memory emvTransferCall =
+            abi.encodeWithSelector(emvSettlement.execute.selector, _createEMVTransactionData());
 
         // Use batch execution to install executor and execute transfer
         Execution[] memory executions = new Execution[](2);
@@ -284,17 +283,10 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function _encodeSimpleTransferCall(bytes memory emvFields) internal view returns (bytes memory) {
-        return _encodeSimpleTransferCall(emvFields, bytesToUint48(bytes6(TEST_ACQUIRER_ID)));
-    }
-
-    function _encodeSimpleTransferCall(bytes memory emvFields, uint48 acquirerId)
-        internal
-        view
-        returns (bytes memory)
-    {
         // Call through Kernel's execute function using delegate call to EMVSettlement.
-        // The inner execute() takes TWO args now: the card-signed emvData and the
-        // switch-supplied acquirerId. The validator parses emvData at innerCalldata+100.
+        // The inner execute() takes a SINGLE arg now: the card-signed emvData. The acquirer is
+        // derived on-chain from the card-signed merchant ID, not supplied by the caller. The
+        // validator parses emvData at innerCalldata+68 (selector(4)+offset(32)+length(32)+emvData).
         return abi.encodeWithSelector(
             kernel.execute.selector,
             ExecLib.encode(
@@ -303,7 +295,7 @@ contract EMVValidatorTest is KernelTestBase {
             abi.encodePacked(
                 address(emvSettlement), // delegate target (20 bytes)
                 // For delegatecall: no value field, just target + calldata
-                abi.encodeWithSelector(emvSettlement.execute.selector, emvFields, acquirerId)
+                abi.encodeWithSelector(emvSettlement.execute.selector, emvFields)
             )
         );
     }
@@ -688,7 +680,10 @@ contract EMVValidatorTest is KernelTestBase {
 
     function test_AcquirerConfigBasics() public {
         uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
-        uint120 merchantId = bytesToUint120(bytes15(TEST_MERCHANT_ID));
+        // Use a merchant ID distinct from the setUp-bound TEST_MERCHANT_ID: merchantAcquirer is a 1:1
+        // global binding, so reusing a merchant already bound to another acquirer (ACQUIR, in setUp)
+        // would revert MerchantBoundToOtherAcquirer here.
+        uint120 merchantId = bytesToUint120(bytes15("BASICMERCH00001"));
         address testMerchantAddress = address(0x789);
 
         // Register acquirer (owner-only)
@@ -731,7 +726,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Test payment distribution calculation
         uint256 totalAmount = 10 ether;
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, totalAmount);
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, totalAmount);
 
         // Verify fee structure (should have acquirer fee, swipe fee, and merchant)
         assertGt(feeRecipients.length, 2);
@@ -745,19 +740,18 @@ contract EMVValidatorTest is KernelTestBase {
     function test_AcquirerConfigNotRegistered() public {
         uint64 testTerminalId = bytesToUint64(bytes8("TESTTERM"));
         uint120 unregisteredMerchantId = bytesToUint120(bytes15("UNREGISTERED123"));
-        uint48 unregisteredAcquirerId = bytesToUint48(bytes6("UNREG1"));
 
-        // Test payment distribution calculation with unregistered acquirer
+        // Test payment distribution calculation with an unregistered merchant.
         uint256 totalAmount = 10 ether;
 
-        // Should revert with InvalidAcquirerId
-        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
-        acquirerConfig.calculatePaymentDistribution(
-            unregisteredMerchantId, testTerminalId, unregisteredAcquirerId, totalAmount
-        );
+        // The acquirer is now derived on-chain from the card-signed merchant ID. An unregistered
+        // merchant has no merchantAcquirer binding, so distribution fails loud with UnknownMerchant
+        // (no caller-supplied acquirer to validate, so InvalidAcquirerId no longer applies here).
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.UnknownMerchant.selector, unregisteredMerchantId));
+        acquirerConfig.calculatePaymentDistribution(unregisteredMerchantId, testTerminalId, totalAmount);
     }
 
-    function test_FallbackToFeeRecipient() public {
+    function test_UnregisteredMerchantReverts() public {
         uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
         uint120 unregisteredMerchantId = bytesToUint120(bytes15("UNREG_MERCHANT"));
         uint64 unregisteredTerminalId = bytesToUint64(bytes8("UNREG_TM"));
@@ -767,19 +761,13 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setAcquirer(testAcquirerId, address(this));
         acquirerConfig.setAcquirerFee(testAcquirerId, feeRecipient, 25);
 
-        // Test payment distribution with unregistered merchant/terminal (should fallback to feeRecipient)
+        // The silent fallback to the acquirer fee recipient for an unregistered merchant was REMOVED:
+        // it would quietly divert the merchant's funds. Distribution now derives the acquirer from the
+        // card-signed merchant ID, and an unregistered merchant (no merchantAcquirer binding) fails
+        // loud with UnknownMerchant rather than paying out to a fallback address.
         uint256 totalAmount = 10 ether;
-        AcquirerConfig.FeeRecipient[] memory feeRecipients = acquirerConfig.calculatePaymentDistribution(
-            unregisteredMerchantId, unregisteredTerminalId, testAcquirerId, totalAmount
-        );
-
-        // Should have at least the merchant entry (using feeRecipient as fallback)
-        assertGt(feeRecipients.length, 0);
-
-        // Last recipient should be the merchant (using feeRecipient as fallback)
-        AcquirerConfig.FeeRecipient memory merchantRecipient = feeRecipients[feeRecipients.length - 1];
-        assertEq(merchantRecipient.recipient, feeRecipient, "Should fallback to feeRecipient for unregistered merchant");
-        assertEq(merchantRecipient.fee, 0, "Merchant fee must be 0");
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.UnknownMerchant.selector, unregisteredMerchantId));
+        acquirerConfig.calculatePaymentDistribution(unregisteredMerchantId, unregisteredTerminalId, totalAmount);
     }
 
     function test_DuplicateRecipientAccumulation() public {
@@ -806,7 +794,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Test payment distribution - should accumulate fees for shared recipient
         uint256 totalAmount = 100 ether;
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, totalAmount);
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, totalAmount);
 
         // Should have fewer recipients due to accumulation
         // Expected: 1 accumulated fee recipient + 1 terminal + 1 merchant = 3 total
@@ -874,7 +862,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Test payment distribution - should have 5 separate recipients (no accumulation)
         uint256 totalAmount = 100 ether;
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, totalAmount);
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, totalAmount);
 
         // Should have 5 recipients: acquirer + swipe + interchange + network + merchant
         assertEq(feeRecipients.length, 5, "Should have 5 separate recipients when all addresses are different");
@@ -1292,7 +1280,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Direct call to settlement should revert
         vm.prank(address(kernel));
         vm.expectRevert(EMVSettlement.InvalidAmount.selector);
-        emvSettlement.execute(zeroAmountData, bytesToUint48(bytes6(TEST_ACQUIRER_ID)));
+        emvSettlement.execute(zeroAmountData);
     }
 
     function test_EMVSettlementInvalidBCDLength() public {
@@ -1307,7 +1295,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Direct call should revert (out of bounds access or returns 0)
         vm.prank(address(kernel));
         vm.expectRevert();
-        emvSettlement.execute(shortData, uint48(0x000001234567));
+        emvSettlement.execute(shortData);
     }
 
     function test_EMVSettlementInvalidBCDDigits() public {
@@ -1330,7 +1318,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Direct call should revert with InvalidAmount (BCD extraction returns 0)
         vm.prank(address(kernel));
         vm.expectRevert(EMVSettlement.InvalidAmount.selector);
-        emvSettlement.execute(invalidBCDData, bytesToUint48(bytes6(TEST_ACQUIRER_ID)));
+        emvSettlement.execute(invalidBCDData);
     }
 
     // Note: BelowTransactionMinimum error is difficult to test in isolation because
@@ -1366,7 +1354,7 @@ contract EMVValidatorTest is KernelTestBase {
         // This will either revert on bounds or give us invalid amount
         vm.prank(address(kernel));
         vm.expectRevert();
-        emvSettlement.execute(shortBCD, uint48(0x000001234567));
+        emvSettlement.execute(shortBCD);
     }
 
     function test_EMVValidatorInvalidSignatureFails() public whenInitialized {
@@ -1423,7 +1411,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // This should work since all fees are 0, so no fee recipients are added
         AcquirerConfig.FeeRecipient[] memory result =
-            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, 100 ether);
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, 100 ether);
 
         // Should only have merchant (all fees are 0)
         assertEq(result.length, 1);
@@ -1485,7 +1473,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // This should work - when all fees are 0, they're not added to the array
         AcquirerConfig.FeeRecipient[] memory result =
-            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, testAcquirerId, 100 ether);
+            acquirerConfig.calculatePaymentDistribution(testMerchantId, testTerminalId, 100 ether);
 
         // Should only have merchant
         assertEq(result.length, 1);
@@ -1517,8 +1505,7 @@ contract EMVValidatorTest is KernelTestBase {
         testConfig.setMerchant(newAcquirer, 1, address(this));
         testConfig.setTerminal(newAcquirer, 1, address(this));
 
-        AcquirerConfig.FeeRecipient[] memory feeRec =
-            testConfig.calculatePaymentDistribution(1, 1, newAcquirer, 1 ether);
+        AcquirerConfig.FeeRecipient[] memory feeRec = testConfig.calculatePaymentDistribution(1, 1, 1 ether);
 
         assertEq(feeRec.length, 1); // Only merchant when all fees are 0
     }
@@ -1864,8 +1851,7 @@ contract EMVValidatorTest is KernelTestBase {
                 CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, ExecModeSelector.wrap(0x00), ExecModePayload.wrap(0x00)
             ),
             abi.encodePacked(
-                address(emvSettlement),
-                abi.encodeWithSelector(emvSettlement.execute.selector, emvFields, e2eAcquirerId)
+                address(emvSettlement), abi.encodeWithSelector(emvSettlement.execute.selector, emvFields)
             )
         );
 

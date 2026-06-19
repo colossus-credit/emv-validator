@@ -104,13 +104,10 @@ contract EMVSettlement is Ownable {
     /**
      * @dev Main entry point: Execute EMV-based ERC20 transfer using validated EMV data
      * @param emvData Packed EMV transaction data (the card-signed message, same bytes the UserOp
-     *        signature covers)
-     * @param acquirerId Acquirer routing ID. Supplied by the switch (the acquiring side), NOT
-     *        card-signed: the terminal can't put a real acquirer in the GPO PDOL, so 9F01 was
-     *        dropped from the signed message. A wrong value can only point at owner-registered
-     *        config (merchant/terminal lookups are namespaced under it), so it can't misroute funds.
+     *        signature covers). The acquirer is NOT in here and is NOT supplied by the caller — it is
+     *        derived on-chain from the card-signed merchant ID, so the relay cannot influence routing.
      */
-    function execute(bytes calldata emvData, uint48 acquirerId) external payable {
+    function execute(bytes calldata emvData) external payable {
         (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
 
         bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
@@ -124,9 +121,9 @@ contract EMVSettlement is Ownable {
             revert InvalidAmount();
         }
 
-        // Get payment distribution from acquirer config (includes all 4 fees + merchant)
+        // Distribution — AcquirerConfig derives the acquirer on-chain from the card-signed merchant ID.
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, acquirerId, transferAmount);
+            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, transferAmount);
 
         // Process payments to all recipients
         _processFeePayments(feeRecipients, transferAmount);

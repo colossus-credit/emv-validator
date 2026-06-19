@@ -398,12 +398,12 @@ contract EMVValidator is IValidator {
         // Skip target(20) bytes to get to inner calldata
         uint256 innerCalldataStart = executionDataStart + 20;
 
-        // Inner calldata = EMVSettlement.execute(bytes emvData, uint48 acquirerId), ABI-encoded:
-        //   selector(4) + offsetToEmvData(32) + acquirerId(32) + emvDataLength(32) + emvData
-        // emvData (the card-signed message) is the dynamic first arg; acquirerId is switch-supplied
-        // and NOT part of the signed message. Skip selector(4)+offset(32)+acquirerId(32)+length(32)=100.
-        uint256 emvDataStart = innerCalldataStart + 100;
-        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 68:innerCalldataStart + 100]));
+        // Inner calldata = EMVSettlement.execute(bytes emvData), ABI-encoded:
+        //   selector(4) + offsetToEmvData(32) + emvDataLength(32) + emvData
+        // emvData is the only (dynamic) arg — the acquirer is derived on-chain from the card-signed
+        // merchant, not passed in. Skip selector(4) + offset(32) + length(32) = 68.
+        uint256 emvDataStart = innerCalldataStart + 68;
+        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 36:innerCalldataStart + 68]));
 
         return callData[emvDataStart:emvDataStart + emvDataLength];
     }

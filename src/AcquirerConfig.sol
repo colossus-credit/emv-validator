@@ -34,6 +34,10 @@ contract AcquirerConfig is Ownable {
     // Mappings
     mapping(uint48 => address) public acquirerAddresses; // Acquirer ID (6 bytes -> uint48) to authorized address
     mapping(uint48 => AcquirerData) private acquirerData; // Acquirer ID (6 bytes -> uint48) to configuration data
+    // Merchant ID (15 bytes -> uint120) to its acquirer (global, 1:1; written by setMerchant). The
+    // card-signed merchant routes the transaction: EMVSettlement derives the acquirer from this map,
+    // so the switch never supplies (and cannot influence) routing.
+    mapping(uint120 => uint48) public merchantAcquirer;
 
     // Network configuration (global, owner-controlled)
     address public networkFeeRecipient; // Address to receive network fees
@@ -71,6 +75,8 @@ contract AcquirerConfig is Ownable {
     error InvalidFee(uint256 position);
     error InvalidMerchantFee();
     error UnauthorizedAcquirer(uint48 acquirerId, address caller);
+    error UnknownMerchant(uint120 merchantId);
+    error MerchantBoundToOtherAcquirer(uint120 merchantId, uint48 existingAcquirer);
 
     // Modifiers
     modifier onlyAcquirer(uint48 acquirerId) {
@@ -174,6 +180,18 @@ contract AcquirerConfig is Ownable {
         onlyAcquirer(acquirerId)
     {
         if (merchantId == 0) revert InvalidMerchantId();
+
+        // Maintain the global merchant -> acquirer binding used for on-chain routing. A merchant maps
+        // to exactly one acquirer: reject if it's already owned by a different one (first-come, so
+        // globally-unique merchant IDs are enforced on-chain). The same acquirer may freely update;
+        // removing (address(0)) frees the binding if the caller owns it.
+        if (merchantAddress == address(0)) {
+            if (merchantAcquirer[merchantId] == acquirerId) delete merchantAcquirer[merchantId];
+        } else {
+            uint48 bound = merchantAcquirer[merchantId];
+            if (bound != 0 && bound != acquirerId) revert MerchantBoundToOtherAcquirer(merchantId, bound);
+            merchantAcquirer[merchantId] = acquirerId;
+        }
 
         acquirerData[acquirerId].merchants[merchantId] = merchantAddress;
         emit MerchantSet(acquirerId, merchantId, merchantAddress);
@@ -396,19 +414,20 @@ contract AcquirerConfig is Ownable {
 
     /**
      * @dev Calculate payment distribution for a transaction with 4-fee structure
-     * @param merchantId The merchant ID as uint120
+     * @param merchantId The merchant ID as uint120 (routes the transaction: acquirer derived from it)
      * @param terminalId The terminal ID as uint64
-     * @param acquirerId The acquirer ID as uint48 - used to access per-acquirer configuration
      * @param totalAmount The total transaction amount
      * @return feeRecipients Array of fee recipients with calculated amounts, merchant last with fee=0
      */
-    function calculatePaymentDistribution(uint120 merchantId, uint64 terminalId, uint48 acquirerId, uint256 totalAmount)
+    function calculatePaymentDistribution(uint120 merchantId, uint64 terminalId, uint256 totalAmount)
         external
         returns (FeeRecipient[] memory feeRecipients)
     {
-        // Validate acquirer is registered
-        if (acquirerAddresses[acquirerId] == address(0)) {
-            revert InvalidAcquirerId();
+        // Derive the acquirer from the card-signed merchant ID (1:1, set via setMerchant). The switch
+        // never supplies it, so a compromised/buggy relay cannot influence routing.
+        uint48 acquirerId = merchantAcquirer[merchantId];
+        if (acquirerId == 0 || acquirerAddresses[acquirerId] == address(0)) {
+            revert UnknownMerchant(merchantId);
         }
 
         // Read acquirer data once into memory to avoid multiple storage reads
@@ -420,12 +439,15 @@ contract AcquirerConfig is Ownable {
         address _interchangeFeeRecipient = interchangeFeeRecipient;
         address _networkFeeRecipient = networkFeeRecipient;
 
-        // Get merchant and terminal addresses, fallback to feeRecipient if not registered
+        // The merchant MUST have a payout address — fail loud (no silent fallback to the acquirer,
+        // which would quietly divert the merchant's funds). merchantAcquirer and the address are set
+        // together in setMerchant, so a bound merchant always has one.
         address merchantAddress = acquirerData[acquirerId].merchants[merchantId];
         if (merchantAddress == address(0)) {
-            merchantAddress = acquirerFeeRecipient;
+            revert UnknownMerchant(merchantId);
         }
 
+        // Terminal address only receives the swipe fee; fall back to the acquirer recipient if unset.
         address terminalAddress = acquirerData[acquirerId].terminals[terminalId];
         if (terminalAddress == address(0)) {
             terminalAddress = acquirerFeeRecipient;
