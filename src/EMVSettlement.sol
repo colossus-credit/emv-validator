@@ -151,25 +151,10 @@ contract EMVSettlement is Ownable {
         pure
         returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset)
     {
-        // 52-byte ATC(2) || PDOL(50) slice-from-front message — current layout. 9F01 (acquirer) and
-        // 9F21 (time) were dropped from the signed PDOL: acquirer is an execute() argument now, and
-        // time drifts between GPO signing and host reconstruction. The validated front block is
-        // unchanged: 9F02 amount @ 9, 9F16 merchant @ 22, 9F1C terminal @ 37.
+        // 52-byte ATC(2) || PDOL(50) slice-from-front message. 9F01 (acquirer) and 9F21 (time)
+        // are not signed; the merchant-selected acquirer is derived on-chain from 9F16.
         if (emvData.length == 52) {
             return (9, 37, 22);
-        }
-
-        // Legacy 61-byte (9F01 still present but ignored — acquirer comes from the arg) and 40-byte.
-        if (emvData.length == 61) {
-            return (9, 37, 22);
-        }
-
-        if (emvData.length == 63) {
-            return (14, 34, 42);
-        }
-
-        if (emvData.length == 40) {
-            return (3, 13, 21);
         }
 
         revert InvalidBCDLength();

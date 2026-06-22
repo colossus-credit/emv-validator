@@ -199,8 +199,8 @@ contract EMVValidatorTest is KernelTestBase {
     function _createEMVFields() internal pure returns (bytes memory) {
         // 52-byte applet message: ATC(2) || PDOL(50), SLICE-FROM-FRONT layout
         // (PaymentApplication.generateEcdsaAtGpo). 9F01 (acquirer) and 9F21 (time) are
-        // DROPPED from the signed PDOL: acquirer is now an EMVSettlement.execute() arg and
-        // time drifts between GPO signing and host reconstruction. The 7 contract-validated
+        // DROPPED from the signed PDOL: settlement derives the acquirer from the signed merchant
+        // ID, and time drifts between GPO signing and host reconstruction. The 7 contract-validated
         // fields are front-loaded; the advisory tail (country/date/MCC) follows.
         return abi.encodePacked(
             TEST_ATC, // 9F36 ATC (2)                       off 0
@@ -284,7 +284,7 @@ contract EMVValidatorTest is KernelTestBase {
 
     function _encodeSimpleTransferCall(bytes memory emvFields) internal view returns (bytes memory) {
         // Call through Kernel's execute function using delegate call to EMVSettlement.
-        // The inner execute() takes a SINGLE arg now: the card-signed emvData. The acquirer is
+        // The inner execute() takes a single arg: the card-signed emvData. The acquirer is
         // derived on-chain from the card-signed merchant ID, not supplied by the caller. The
         // validator parses emvData at innerCalldata+68 (selector(4)+offset(32)+length(32)+emvData).
         return abi.encodeWithSelector(
@@ -497,7 +497,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         bytes memory reroutedFields = _createEMVFields();
         // Slice-from-front settlement routing offsets: 9F16 Merchant @ 22, 9F1C Terminal @ 37.
-        // 9F01 Acquirer is no longer in the signed message (it is an execute() arg now).
+        // 9F01 Acquirer is no longer in the signed message.
         reroutedFields = _replaceEMVField(reroutedFields, 22, abi.encodePacked(bytes15("BADMERCHANT0001")));
         reroutedFields = _replaceEMVField(reroutedFields, 37, abi.encodePacked(bytes8("BADTERM1")));
 
@@ -680,9 +680,6 @@ contract EMVValidatorTest is KernelTestBase {
 
     function test_AcquirerConfigBasics() public {
         uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
-        // Use a merchant ID distinct from the setUp-bound TEST_MERCHANT_ID: merchantAcquirer is a 1:1
-        // global binding, so reusing a merchant already bound to another acquirer (ACQUIR, in setUp)
-        // would revert MerchantBoundToOtherAcquirer here.
         uint120 merchantId = bytesToUint120(bytes15("BASICMERCH00001"));
         address testMerchantAddress = address(0x789);
 
@@ -694,12 +691,47 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Check registration
         assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertTrue(acquirerConfig.isMerchantRegistered(merchantId));
         assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, merchantId), testMerchantAddress);
+        assertEq(acquirerConfig.getMerchantAddress(merchantId), testMerchantAddress);
+        assertEq(acquirerConfig.merchantAcquirer(merchantId), testAcquirerId);
 
         // Test removal
         acquirerConfig.setMerchant(testAcquirerId, merchantId, address(0));
         assertFalse(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertFalse(acquirerConfig.isMerchantRegistered(merchantId));
         assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, merchantId), address(0));
+        assertEq(acquirerConfig.getMerchantAddress(merchantId), address(0));
+    }
+
+    function test_MerchantControlsSelectedAcquirer() public {
+        uint48 firstAcquirerId = bytesToUint48(bytes6("ACQ001"));
+        uint48 secondAcquirerId = bytesToUint48(bytes6("ACQ002"));
+        uint120 merchantId = bytesToUint120(bytes15("MERCH_SELF_SET1"));
+        address firstAcquirer = makeAddr("firstAcquirer");
+        address merchant = makeAddr("merchantController");
+        address attacker = makeAddr("merchantAttacker");
+
+        acquirerConfig.setAcquirer(firstAcquirerId, firstAcquirer);
+        acquirerConfig.setAcquirer(secondAcquirerId, address(this));
+
+        vm.prank(firstAcquirer);
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.UnauthorizedMerchant.selector, merchantId, firstAcquirer));
+        acquirerConfig.setMerchant(firstAcquirerId, merchantId, merchant);
+
+        vm.prank(merchant);
+        acquirerConfig.setMerchant(firstAcquirerId, merchantId, merchant);
+        assertEq(acquirerConfig.merchantAcquirer(merchantId), firstAcquirerId);
+
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.UnauthorizedMerchant.selector, merchantId, attacker));
+        acquirerConfig.setMerchant(secondAcquirerId, merchantId, merchant);
+
+        vm.prank(merchant);
+        acquirerConfig.setMerchant(secondAcquirerId, merchantId, merchant);
+        assertEq(acquirerConfig.merchantAcquirer(merchantId), secondAcquirerId);
+        assertEq(acquirerConfig.getMerchantAddress(secondAcquirerId, merchantId), merchant);
+        assertEq(acquirerConfig.getMerchantAddress(firstAcquirerId, merchantId), address(0));
     }
 
     function test_AcquirerAndTerminalFees() public {
@@ -1048,9 +1080,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         vm.startPrank(unauthorized);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(AcquirerConfig.UnauthorizedAcquirer.selector, testAcquirerId, unauthorized)
-        );
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.UnauthorizedMerchant.selector, uint120(1), unauthorized));
         acquirerConfig.setMerchant(testAcquirerId, 1, makeAddr("merchant"));
 
         vm.expectRevert(
@@ -1299,21 +1329,7 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function test_EMVSettlementInvalidBCDDigits() public {
-        // Create EMV data with invalid BCD digits (>9)
-        bytes memory invalidBCDData = abi.encodePacked(
-            TEST_ARQC, // 8 bytes
-            hex"11223344", // 4 bytes unpredictable
-            hex"0001", // 2 bytes ATC
-            hex"0000000000FF", // Invalid BCD digit (0xFF has nibbles 15,15 which are >9)
-            TEST_CURRENCY,
-            TEST_DATE,
-            TEST_TXN_TYPE,
-            TEST_TVR,
-            TEST_CVM_RESULTS,
-            TEST_TERMINAL_ID,
-            TEST_MERCHANT_ID,
-            TEST_ACQUIRER_ID
-        );
+        bytes memory invalidBCDData = _replaceEMVField(_createEMVFields(), 9, hex"0000000000FF");
 
         // Direct call should revert with InvalidAmount (BCD extraction returns 0)
         vm.prank(address(kernel));
@@ -1340,20 +1356,10 @@ contract EMVValidatorTest is KernelTestBase {
     }
 
     function test_EMVSettlementInvalidBCDReturnsZero() public {
-        // Test line 199: when BCD length != 6, should return 0 which triggers InvalidAmount
-        // Create data where amount field is less than 6 bytes
-        bytes memory shortBCD = abi.encodePacked(
-            TEST_ARQC, // 8 bytes
-            TEST_UNPREDICTABLE_NUMBER, // 4 bytes
-            TEST_ATC, // 2 bytes
-            hex"0000", // Only 2 bytes instead of 6 - will trigger line 199
-            TEST_CURRENCY // This shifts everything
-        );
+        bytes memory shortBCD = _replaceEMVField(_createEMVFields(), 9, hex"0000000000FF");
 
-        // The function will try to read at wrong offsets and get invalid data
-        // This will either revert on bounds or give us invalid amount
         vm.prank(address(kernel));
-        vm.expectRevert();
+        vm.expectRevert(EMVSettlement.InvalidAmount.selector);
         emvSettlement.execute(shortBCD);
     }
 

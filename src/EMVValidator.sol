@@ -58,9 +58,9 @@ contract EMVValidator is IValidator {
 
     // Offsets within the 52-byte ATC(2) || PDOL(50) slice-from-front message. The P-256 signature
     // covers all 52 bytes; this records which signed fields the contracts also *enforce*, and where.
-    // 9F01 (acquirer) and 9F21 (time) are NOT signed: acquirer is an EMVSettlement.execute() argument
-    // (the terminal can't put a real acquirer in the GPO), and time drifts between GPO sign and host
-    // reconstruction. Their removal shifts the advisory tail (Country/Date/MCC) back by 6 bytes.
+    // 9F01 (acquirer) and 9F21 (time) are NOT signed: terminals cannot reliably supply a real
+    // acquirer at GPO, and time drifts between GPO signing and host reconstruction. Settlement
+    // derives the acquirer from the signed merchant ID instead.
     //   off  len  tag    field                          enforced by
     //   0    2    9F36   ATC (card-prefixed)            EMVValidator (replay)
     //   2    4    9F37   Unpredictable Number           EMVValidator (replay)
@@ -443,9 +443,9 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
-        // Replay/currency offsets within the 61-byte ATC(2) || PDOL(59) signed message. The full
+        // Replay/currency offsets within the 52-byte ATC(2) || PDOL(50) signed message. The full
         // signed-field map — including the type / amount-other / currency-exponent fields enforced
-        // in _validateAuxiliaryFields and the merchant/terminal/acquirer fields EMVSettlement reads —
+        // in _validateAuxiliaryFields and the merchant/terminal fields EMVSettlement reads —
         // is tabulated at the offset constants near EMV_FIELDS_LENGTH.
         // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset) = (2, 0, 9, 7)
         if (emvFields.length == EMV_FIELDS_LENGTH) {
@@ -467,7 +467,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract ATC (2 bytes) from packed EMV fields - Assembly optimized
-     * Offset 0 of the 61-byte ATC(2)||PDOL(59) message. This is the pre-increment
+     * Offset 0 of the 52-byte ATC(2)||PDOL(50) message. This is the pre-increment
      * ATC the applet signs at GPO (N); replay state tracks N then advances to N+1.
      */
     function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
@@ -479,7 +479,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract currency (2 bytes) from packed EMV fields - Assembly optimized
-     * 5F2A at offset 16 of the 61-byte message (PDOL offset 14).
+     * 5F2A at offset 7 of the 52-byte message.
      */
     function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (,,, uint256 currencyOffset) = _emvFieldOffsets(emvFields);
@@ -504,10 +504,10 @@ contract EMVValidator is IValidator {
     /**
      * @dev Enforce the card-signed "validated" fields the settlement does not consume:
      * 9C transaction type, 9F03 amount-other, 5F36 currency exponent. The P-256 signature already
-     * binds all 61 bytes; this records which signed values the contract accepts (pilot policy:
+     * binds all 52 bytes; this records which signed values the contract accepts (pilot policy:
      * purchases only, no secondary amount, USD/USN minor units). Runs before signature verification,
      * alongside the currency check, so an unsupported field fails fast with a precise error.
-     * @param emvFields The 61-byte EMV fields calldata
+     * @param emvFields The 52-byte EMV fields calldata
      */
     function _validateAuxiliaryFields(bytes calldata emvFields) internal pure {
         // 9C Transaction Type @ 6 — purchase (0x00) only.
@@ -605,7 +605,7 @@ contract EMVValidator is IValidator {
         view
         returns (bool)
     {
-        // emvFields IS the applet's signed message: ATC(2) || PDOL(59) = 61 bytes,
+        // emvFields IS the applet's signed message: ATC(2) || PDOL(50) = 52 bytes,
         // with no TLV framing. The applet signs SHA-256(message) with ECDSA-P256
         // (ALG_ECDSA_SHA_256), emitting raw r||s. Hash the whole message and verify.
         bytes32 messageHash = sha256(emvFields);
