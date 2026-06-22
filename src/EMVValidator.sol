@@ -493,10 +493,10 @@ contract EMVValidator is IValidator {
      * @param emvFields The EMV fields calldata to extract currency from
      */
     function _validateCurrencyCode(bytes calldata emvFields) internal pure {
-        // Accept both BCD-style n3 encoding and uint16 numeric encoding used by local fixtures.
+        // Accept only canonical EMV n3 BCD-style encoding for USD (840) or USN (997).
         bytes2 currencyBytes = _extractCurrency(emvFields);
         uint16 currency = uint16(currencyBytes);
-        if (currency != 0x0840 && currency != 0x0997 && currency != 840 && currency != 997) {
+        if (currency != 0x0840 && currency != 0x0997) {
             revert InvalidCurrencyCode(currency);
         }
     }

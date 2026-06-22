@@ -1261,6 +1261,23 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
     }
 
+    function test_EMVValidatorRejectsNonCanonicalCurrencyEncoding() public whenInitialized {
+        _installEMVValidator();
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+
+        // 840 encoded as uint16 decimal is 0x0348, but EMV 5F2A must be canonical n3 BCD-style 0x0840.
+        op.callData = _encodeSimpleTransferCall(_replaceEMVField(_createEMVFields(), 7, hex"0348"));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidCurrencyCode.selector, uint16(840)));
+        emvValidator.validateUserOp(op, bytes32(0));
+
+        // Same rule for USN 997: 0x03e5 is uint16 decimal, not canonical 0x0997.
+        op.callData = _encodeSimpleTransferCall(_replaceEMVField(_createEMVFields(), 7, hex"03e5"));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidCurrencyCode.selector, uint16(997)));
+        emvValidator.validateUserOp(op, bytes32(0));
+    }
+
     function test_EMVValidatorReplayProtection() public whenInitialized {
         _installEMVValidator();
 
