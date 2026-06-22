@@ -7,7 +7,7 @@ import {Ownable} from "solady/auth/Ownable.sol";
 /**
  * @title AcquirerConfig
  * @dev Registry for approved merchants with 4-fee structure: acquirer, swipe, interchange, network
- * @notice Uses per-acquirer configuration with owner-controlled acquirer assignment
+ * @notice Merchant IDs are the low 15 bytes of the merchant account address.
  */
 contract AcquirerConfig is Ownable {
     // Struct to represent a fee recipient
@@ -24,13 +24,6 @@ contract AcquirerConfig is Ownable {
         mapping(uint64 => address) terminals; // Terminal ID (8 bytes -> uint64) to address mapping
     }
 
-    // Struct to hold merchant-controlled routing data
-    struct MerchantData {
-        address recipient; // Address to receive merchant proceeds
-        address controller; // Address authorized to update this merchant
-        uint48 acquirerId; // Merchant-selected acquirer
-    }
-
     // Basis points constants
     uint256 private constant ONE_HUNDRED_PERCENT_BP = 10000;
     uint256 private constant ACQUIRER_FEE_MAX_BP = 30; // Max 0.30%
@@ -40,7 +33,7 @@ contract AcquirerConfig is Ownable {
     // Mappings
     mapping(uint48 => address) public acquirerAddresses; // Acquirer ID (6 bytes -> uint48) to authorized address
     mapping(uint48 => AcquirerData) private acquirerData; // Acquirer ID (6 bytes -> uint48) to configuration data
-    mapping(uint120 => MerchantData) private merchantData; // Merchant ID (15 bytes -> uint120) to routing data
+    mapping(uint120 => address) public merchants; // Merchant ID (low 15 bytes of address) to merchant account
     // merchant (15B -> uint120) -> acquirer; routing derives from this merchant-owned binding.
     mapping(uint120 => uint48) public merchantAcquirer;
 
@@ -175,51 +168,59 @@ contract AcquirerConfig is Ownable {
     // ========== ACQUIRER FUNCTIONS ==========
 
     /**
-     * @dev Set merchant recipient and selected acquirer.
-     *      New merchants may be bootstrapped by the owner or self-registered by the recipient address.
-     *      Existing merchants may be updated by the merchant controller or owner.
-     * @param acquirerId The merchant-selected acquirer ID
-     * @param merchantId The merchant ID from EMV data (9F16) as uint120
-     * @param merchantAddress Address of the merchant recipient/controller (use address(0) to remove)
+     * @dev Derive an EMV merchant ID from the low 15 bytes of the merchant account address.
+     * @param merchantAddress The merchant account address
+     * @return merchantId The 15-byte merchant ID used in signed EMV data
      */
-    function setMerchant(uint48 acquirerId, uint120 merchantId, address merchantAddress) external {
+    function merchantIdFromAddress(address merchantAddress) public pure returns (uint120 merchantId) {
+        merchantId = uint120(uint160(merchantAddress));
         if (merchantId == 0) revert InvalidMerchantId();
+    }
+
+    /**
+     * @dev Set merchant account and selected acquirer.
+     *      The merchant account is both the payout recipient and the controller.
+     *      New merchants may be bootstrapped by the owner or self-registered by the merchant account.
+     * @param acquirerId The merchant-selected acquirer ID
+     * @param merchantAddress Address of the merchant account
+     */
+    function setMerchant(uint48 acquirerId, address merchantAddress) external {
         if (acquirerAddresses[acquirerId] == address(0)) revert InvalidAcquirerId();
 
+        uint120 merchantId = merchantIdFromAddress(merchantAddress);
         _setMerchant(acquirerId, merchantId, merchantAddress);
     }
 
     function _setMerchant(uint48 acquirerId, uint120 merchantId, address merchantAddress) internal {
-        MerchantData storage merchant = merchantData[merchantId];
-        address controller = merchant.controller;
-
-        if (merchantAddress == address(0)) {
-            _requireMerchantController(merchantId, controller);
-            delete merchantData[merchantId];
-            delete merchantAcquirer[merchantId];
-            emit MerchantSet(acquirerId, merchantId, address(0));
-            return;
+        address currentMerchant = merchants[merchantId];
+        if (currentMerchant != address(0) && currentMerchant != merchantAddress) {
+            revert UnauthorizedMerchant(merchantId, msg.sender);
+        }
+        if (msg.sender != owner() && msg.sender != merchantAddress) {
+            revert UnauthorizedMerchant(merchantId, msg.sender);
         }
 
-        if (controller == address(0)) {
-            if (msg.sender != owner() && msg.sender != merchantAddress) {
-                revert UnauthorizedMerchant(merchantId, msg.sender);
-            }
-        } else {
-            _requireMerchantController(merchantId, controller);
-        }
-
-        merchant.recipient = merchantAddress;
-        merchant.controller = merchantAddress;
-        merchant.acquirerId = acquirerId;
+        merchants[merchantId] = merchantAddress;
         merchantAcquirer[merchantId] = acquirerId;
         emit MerchantSet(acquirerId, merchantId, merchantAddress);
     }
 
-    function _requireMerchantController(uint120 merchantId, address controller) internal view {
-        if (msg.sender != owner() && msg.sender != controller) {
+    /**
+     * @dev Remove a merchant account and its selected acquirer binding.
+     * @param merchantAddress Address of the merchant account
+     */
+    function removeMerchant(address merchantAddress) external {
+        uint120 merchantId = merchantIdFromAddress(merchantAddress);
+        address currentMerchant = merchants[merchantId];
+        if (currentMerchant == address(0)) revert UnknownMerchant(merchantId);
+        if (currentMerchant != merchantAddress || (msg.sender != owner() && msg.sender != merchantAddress)) {
             revert UnauthorizedMerchant(merchantId, msg.sender);
         }
+
+        uint48 acquirerId = merchantAcquirer[merchantId];
+        delete merchants[merchantId];
+        delete merchantAcquirer[merchantId];
+        emit MerchantSet(acquirerId, merchantId, address(0));
     }
 
     /**
@@ -245,8 +246,7 @@ contract AcquirerConfig is Ownable {
      * @return merchantAddress The registered address (address(0) if not registered for this acquirer)
      */
     function getMerchantAddress(uint48 acquirerId, uint120 merchantId) external view returns (address) {
-        MerchantData storage merchant = merchantData[merchantId];
-        return merchant.acquirerId == acquirerId ? merchant.recipient : address(0);
+        return merchantAcquirer[merchantId] == acquirerId ? merchants[merchantId] : address(0);
     }
 
     /**
@@ -255,23 +255,17 @@ contract AcquirerConfig is Ownable {
      * @return merchantAddress The registered address (address(0) if not registered)
      */
     function getMerchantAddress(uint120 merchantId) external view returns (address) {
-        return merchantData[merchantId].recipient;
+        return merchants[merchantId];
     }
 
     /**
      * @dev Get merchant routing config.
      * @param merchantId The merchant ID as uint120
-     * @return merchantAddress The registered merchant recipient
-     * @return controller The address authorized to update this merchant
+     * @return merchantAddress The registered merchant account
      * @return acquirerId The merchant-selected acquirer
      */
-    function getMerchantConfig(uint120 merchantId)
-        external
-        view
-        returns (address merchantAddress, address controller, uint48 acquirerId)
-    {
-        MerchantData storage merchant = merchantData[merchantId];
-        return (merchant.recipient, merchant.controller, merchant.acquirerId);
+    function getMerchantConfig(uint120 merchantId) external view returns (address merchantAddress, uint48 acquirerId) {
+        return (merchants[merchantId], merchantAcquirer[merchantId]);
     }
 
     /**
@@ -291,8 +285,7 @@ contract AcquirerConfig is Ownable {
      * @return isRegistered True if the merchant is registered for this acquirer
      */
     function isMerchantRegistered(uint48 acquirerId, uint120 merchantId) external view returns (bool) {
-        MerchantData storage merchant = merchantData[merchantId];
-        return merchant.acquirerId == acquirerId && merchant.recipient != address(0);
+        return merchantAcquirer[merchantId] == acquirerId && merchants[merchantId] != address(0);
     }
 
     /**
@@ -301,7 +294,7 @@ contract AcquirerConfig is Ownable {
      * @return isRegistered True if the merchant is registered
      */
     function isMerchantRegistered(uint120 merchantId) external view returns (bool) {
-        return merchantData[merchantId].recipient != address(0);
+        return merchants[merchantId] != address(0);
     }
 
     /**
@@ -315,23 +308,16 @@ contract AcquirerConfig is Ownable {
     }
 
     /**
-     * @dev Batch set multiple merchant recipients and selected acquirer - owner only bootstrap helper
+     * @dev Batch set multiple merchant accounts and selected acquirer - owner only bootstrap helper
      * @param acquirerId The merchant-selected acquirer ID
-     * @param merchantIds Array of merchant IDs as uint120
-     * @param addresses Array of corresponding addresses (use address(0) to remove)
+     * @param addresses Array of merchant account addresses
      */
-    function batchSetMerchants(uint48 acquirerId, uint120[] calldata merchantIds, address[] calldata addresses)
-        external
-        onlyOwner
-    {
+    function batchSetMerchants(uint48 acquirerId, address[] calldata addresses) external onlyOwner {
         if (acquirerAddresses[acquirerId] == address(0)) revert InvalidAcquirerId();
-        require(merchantIds.length == addresses.length, "AcquirerConfig: array length mismatch");
 
-        for (uint256 i = 0; i < merchantIds.length; i++) {
-            uint120 merchantId = merchantIds[i];
+        for (uint256 i = 0; i < addresses.length; i++) {
             address merchantAddress = addresses[i];
-
-            if (merchantId == 0) revert InvalidMerchantId();
+            uint120 merchantId = merchantIdFromAddress(merchantAddress);
 
             _setMerchant(acquirerId, merchantId, merchantAddress);
         }
@@ -485,9 +471,9 @@ contract AcquirerConfig is Ownable {
         returns (FeeRecipient[] memory feeRecipients)
     {
         // Acquirer is derived from the card-signed merchant, never supplied by the caller.
-        MerchantData storage merchant = merchantData[merchantId];
-        uint48 acquirerId = merchant.acquirerId;
-        if (acquirerId == 0 || acquirerAddresses[acquirerId] == address(0) || merchant.recipient == address(0)) {
+        address merchantAddress = merchants[merchantId];
+        uint48 acquirerId = merchantAcquirer[merchantId];
+        if (acquirerId == 0 || acquirerAddresses[acquirerId] == address(0) || merchantAddress == address(0)) {
             revert UnknownMerchant(merchantId);
         }
 
@@ -499,9 +485,6 @@ contract AcquirerConfig is Ownable {
         // Cache global fee recipients to local variables for assembly use
         address _interchangeFeeRecipient = interchangeFeeRecipient;
         address _networkFeeRecipient = networkFeeRecipient;
-
-        // Require a merchant payout address; no silent fallback to the acquirer.
-        address merchantAddress = merchant.recipient;
 
         // Terminal address only receives the swipe fee; fall back to the acquirer recipient if unset.
         address terminalAddress = acquirerData[acquirerId].terminals[terminalId];

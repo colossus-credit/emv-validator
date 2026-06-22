@@ -154,8 +154,8 @@ forge create src/EMVValidator.sol:EMVValidator \
 acquirerConfig.setAcquirer(acquirerId, acquirerAddress);
 acquirerConfig.setAcquirerFee(acquirerId, feeRecipient, 15); // 0.15%
 
-// 2. Register merchants
-acquirerConfig.setMerchant(acquirerId, merchantId, merchantAddress);
+// 2. Register merchants. merchantId is derived from the low 15 bytes of merchantAddress.
+acquirerConfig.setMerchant(acquirerId, merchantAddress);
 
 // 3. Register terminals
 acquirerConfig.setTerminal(acquirerId, terminalId, terminalAddress);
