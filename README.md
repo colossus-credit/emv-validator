@@ -13,7 +13,7 @@ This project enables smart contract wallets to accept payment card transactions 
 - **💰 Multi-Fee Settlement**: Configurable fee distribution (acquirer, swipe, interchange, network)
 - **🛡️ Replay Protection**: Dual protection via unpredictable numbers and application transaction counters (ATC)
 - **⚡ Gas Optimized**: Assembly-optimized calldata extraction and storage operations
-- **🌐 Merchant Registry**: Decentralized registry for acquirers, merchants, and terminals
+- **🌐 Merchant Registry**: Decentralized registry for acquirers and merchant-selected routing
 
 ## Architecture
 
@@ -34,13 +34,13 @@ This project enables smart contract wallets to accept payment card transactions 
    - Calculates merchant remainder after fee deductions
 
 3. **`AcquirerConfig.sol`**
-   - Centralized merchant and terminal registry
+   - Merchant-selected acquirer registry
    - Configurable four-tier fee structure:
      - Acquirer fee (0-0.30%)
-     - Terminal swipe fee (fixed amount)
+     - Fixed acquirer swipe fee
      - Interchange fee (0-2.50%)
      - Network fee (0-0.15%)
-   - Per-acquirer configuration with owner-controlled assignment
+   - Per-acquirer fee configuration with merchant-controlled assignment
    - Gas-optimized fee deduplication using transient storage (EIP-1153)
 
 ## How It Works
@@ -71,13 +71,12 @@ This project enables smart contract wallets to accept payment card transactions 
 
 ### EMV Data Format
 
-Transactions pack 63 bytes of EMV data + RSA components:
+Transactions pack the 52-byte card-signed ATC + PDOL message:
 
 ```
-ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + 
-Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) +
-TerminalId(8) + MerchantId(15) + AcquirerId(6) +
-Signature(256) + Exponent(3) + Modulus(256)
+ATC(2) + UnpredictableNumber(4) + TxnType(1) + Currency(2) +
+Amount(6) + AmountOther(6) + CurrencyExponent(1) + MerchantId(15) +
+TerminalId(8) + TerminalCountry(2) + TxnDate(3) + MCC(2)
 ```
 
 Amounts are BCD-encoded (e.g., `0x000000012345` = $123.45).
@@ -154,13 +153,10 @@ forge create src/EMVValidator.sol:EMVValidator \
 acquirerConfig.setAcquirer(acquirerId, acquirerAddress);
 acquirerConfig.setAcquirerFee(acquirerId, feeRecipient, 15); // 0.15%
 
-// 2. Register merchants. merchantId is derived from the low 15 bytes of merchantAddress.
-acquirerConfig.setMerchant(acquirerId, merchantAddress);
+// 2. Merchant selects an acquirer. merchantId is derived from msg.sender's low 15 bytes.
+acquirerConfig.setMerchant(acquirerId);
 
-// 3. Register terminals
-acquirerConfig.setTerminal(acquirerId, terminalId, terminalAddress);
-
-// 4. Set global fees
+// 3. Set global fees
 acquirerConfig.setNetworkFee(networkRecipient, 10); // 0.10%
 acquirerConfig.setInterchangeFee(interchangeRecipient, 180); // 1.80%
 acquirerConfig.setSwipeFee(acquirerId, swipeFeeAmount);

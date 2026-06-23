@@ -70,7 +70,7 @@ contract EMVValidator is IValidator {
     //   15   6    9F03   Amount, Other                  EMVValidator (_validateAuxiliaryFields)
     //   21   1    5F36   Transaction Currency Exponent  EMVValidator (_validateAuxiliaryFields)
     //   22   15   9F16   Merchant Identifier            EMVSettlement (routing)
-    //   37   8    9F1C   Terminal Identification        EMVSettlement (routing)
+    //   37   8    9F1C   Terminal Identification        advisory (signed only)
     //   45   2    9F1A   Terminal Country Code          advisory (signed only)
     //   47   3    9A     Transaction Date               advisory (signed only)
     //   50   2    9F15   Merchant Category Code         advisory (signed only)

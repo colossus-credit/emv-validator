@@ -107,10 +107,9 @@ contract EMVSettlement is Ownable {
      * @param emvData The card-signed message (the bytes the UserOp signature covers).
      */
     function execute(bytes calldata emvData) external payable {
-        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
+        (uint256 amountOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
 
         bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
-        uint64 terminalId = uint64(bytes8(emvData[terminalOffset:terminalOffset + 8]));
         uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
@@ -122,7 +121,7 @@ contract EMVSettlement is Ownable {
 
         // Distribution — AcquirerConfig derives the acquirer on-chain from the card-signed merchant ID.
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, transferAmount);
+            acquirerConfig.calculatePaymentDistribution(merchantId, transferAmount);
 
         // Process payments to all recipients
         _processFeePayments(feeRecipients, transferAmount);
@@ -149,12 +148,12 @@ contract EMVSettlement is Ownable {
     function _emvSettlementOffsets(bytes calldata emvData)
         internal
         pure
-        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset)
+        returns (uint256 amountOffset, uint256 merchantOffset)
     {
         // 52-byte ATC(2) || PDOL(50) slice-from-front message. 9F01 (acquirer) and 9F21 (time)
         // are not signed; the merchant-selected acquirer is derived on-chain from 9F16.
         if (emvData.length == 52) {
-            return (9, 37, 22);
+            return (9, 22);
         }
 
         revert InvalidBCDLength();
