@@ -6,7 +6,7 @@ import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
-import {SIG_VALIDATION_SUCCESS_UINT} from "kernel/src/types/Constants.sol";
+import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "kernel/src/types/Constants.sol";
 import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
@@ -1336,22 +1336,51 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
     }
 
-    function test_EMVValidatorInvalidATCSequence() public whenInitialized {
+    function test_EMVValidatorAtcGapAccepted() public whenInitialized {
+        // Strictly-increasing ATC: a card-signed ATC ABOVE the expected (a gap left by an
+        // off-chain-declined tap that incremented the card without reaching the validator) PASSES the
+        // ATC check. Validation then proceeds to signature verification, which fails only because the
+        // test's fixed signature is over the default message — so we get SIG_VALIDATION_FAILED, NOT a
+        // revert with InvalidATCSequence. (Under the old strict-equality check this reverted.)
         _installEMVValidator();
 
+        bytes memory fields = _replaceEMVField(_createEMVFields(), 0, hex"0005"); // ATC 5 @ byte 0
+        fields = _replaceEMVField(fields, 2, hex"55667788"); // fresh 9F37 UN @ byte 2
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall(fields);
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        uint256 validationData = emvValidator.validateUserOp(op, bytes32(0));
+        assertEq(validationData, SIG_VALIDATION_FAILED_UINT, "ATC gap accepted; only the sig fails");
+    }
+
+    function test_EMVValidatorInvalidATCSequence() public whenInitialized {
+        // With strictly-increasing ATC, ONLY a card-signed ATC BELOW the expected reverts
+        // (replay / regression) — a higher one is tolerated (see the gap test above).
+        _installEMVValidator();
         mockERC20.transfer(address(kernel), 1e21);
-        vm.deal(address(kernel), 2e18);
+        vm.deal(address(kernel), 1e18);
 
-        // Build a valid 52-byte message, then set ATC = 5 (expected is 0) and a fresh UN so the
-        // replay-protection check reverts with InvalidATCSequence before signature verification.
-        bytes memory wrongATCFields = _replaceEMVField(_createEMVFields(), 0, hex"0005"); // ATC @ 0
-        wrongATCFields = _replaceEMVField(wrongATCFields, 2, hex"55667788"); // 9F37 UN @ 2
-
+        // A valid default tap (ATC 0) settles and advances the expected ATC to 1.
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(wrongATCFields), true);
-
-        vm.expectRevert();
+        ops[0] = _prepareEMVUserOp(_encodeSimpleTransferCall(), true);
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+        (uint256 expected,,) = emvValidator.getCardState(address(kernel), _testKeyHash());
+        assertEq(expected, 1, "expected ATC advanced after the valid tap");
+
+        // A subsequent ATC 0 (< expected 1) with a FRESH UN reverts at the ATC check, before the
+        // signature check.
+        bytes memory low = _replaceEMVField(_createEMVFields(), 2, hex"99887766"); // fresh UN, ATC stays 0
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall(low);
+        op.signature = _createEMVSignature();
+        vm.prank(address(kernel));
+        vm.expectRevert(abi.encodeWithSelector(EMVValidator.InvalidATCSequence.selector, uint16(1), uint16(0)));
+        emvValidator.validateUserOp(op, bytes32(0));
     }
 
     function test_AcquirerConfigAddressZeroInFeeRecipient() public {
