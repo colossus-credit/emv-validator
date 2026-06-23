@@ -21,7 +21,10 @@ contract AcquirerConfig is Ownable {
         address acquirerFeeRecipient; // Address to receive acquirer fees
         uint256 acquirerFeeRate; // Acquirer fee rate in basis points (0-30)
         uint256 swipeFee; // Fixed swipe fee amount
-        mapping(uint64 => address) terminals; // Terminal ID (8 bytes -> uint64) to address mapping
+    }
+    struct MerchantData {
+        address merchant; // Address to receive merchant fees
+        uint48 acquirerId; // Acquirer ID (6 bytes -> uint48) to authorized address
     }
 
     // Basis points constants
@@ -31,11 +34,9 @@ contract AcquirerConfig is Ownable {
     uint256 private constant INTERCHANGE_FEE_MAX_BP = 250; // Max 2.50%
 
     // Mappings
-    mapping(uint48 => address) public acquirerAddresses; // Acquirer ID (6 bytes -> uint48) to authorized address
+    mapping(uint48 => address) public acquirers; // Acquirer ID (6 bytes -> uint48) to authorized address
     mapping(uint48 => AcquirerData) private acquirerData; // Acquirer ID (6 bytes -> uint48) to configuration data
-    mapping(uint120 => address) public merchants; // Merchant ID (low 15 bytes of address) to merchant account
-    // merchant (15B -> uint120) -> acquirer; routing derives from this merchant-owned binding.
-    mapping(uint120 => uint48) public merchantAcquirer;
+    mapping(uint120 => MerchantData) public merchantData;
 
     // Network configuration (global, owner-controlled)
     address public networkFeeRecipient; // Address to receive network fees
@@ -48,6 +49,7 @@ contract AcquirerConfig is Ownable {
     // Events
     event AcquirerSet(uint48 indexed acquirerId, address indexed acquirerAddress);
     event MerchantSet(uint48 indexed acquirerId, uint120 indexed merchantId, address recipient);
+    event MerchantRemoved(uint48 indexed acquirerId, uint120 indexed merchantId, address recipient);
     event TerminalSet(uint48 indexed acquirerId, uint64 indexed terminalId, address recipient);
     event AcquirerFeeUpdated(
         uint48 indexed acquirerId,
@@ -78,10 +80,10 @@ contract AcquirerConfig is Ownable {
 
     // Modifiers
     modifier onlyAcquirer(uint48 acquirerId) {
-        if (acquirerAddresses[acquirerId] == address(0)) {
+        if (acquirers[acquirerId] == address(0)) {
             revert InvalidAcquirerId();
         }
-        if (acquirerAddresses[acquirerId] != msg.sender) {
+        if (acquirers[acquirerId] != msg.sender) {
             revert UnauthorizedAcquirer(acquirerId, msg.sender);
         }
         _;
@@ -172,9 +174,8 @@ contract AcquirerConfig is Ownable {
      * @param merchantAddress The merchant account address
      * @return merchantId The 15-byte merchant ID used in signed EMV data
      */
-    function merchantIdFromAddress(address merchantAddress) public pure returns (uint120 merchantId) {
+    function getMerchantId(address merchantAddress) public pure returns (uint120 merchantId) {
         merchantId = uint120(uint160(merchantAddress));
-        if (merchantId == 0) revert InvalidMerchantId();
     }
 
     /**
@@ -184,24 +185,21 @@ contract AcquirerConfig is Ownable {
      * @param acquirerId The merchant-selected acquirer ID
      * @param merchantAddress Address of the merchant account
      */
-    function setMerchant(uint48 acquirerId, address merchantAddress) external {
+    function setMerchant(uint48 acquirerId) external {
         if (acquirerAddresses[acquirerId] == address(0)) revert InvalidAcquirerId();
 
-        uint120 merchantId = merchantIdFromAddress(merchantAddress);
-        _setMerchant(acquirerId, merchantId, merchantAddress);
+        uint120 merchantId = getMerchantId(msg.sender);
+        _setMerchant(acquirerId, merchantId, msg.sender);
     }
 
     function _setMerchant(uint48 acquirerId, uint120 merchantId, address merchantAddress) internal {
-        address currentMerchant = merchants[merchantId];
+        address currentMerchant = merchantData[merchantId].merchant;
+
         if (currentMerchant != address(0) && currentMerchant != merchantAddress) {
             revert UnauthorizedMerchant(merchantId, msg.sender);
         }
-        if (msg.sender != owner() && msg.sender != merchantAddress) {
-            revert UnauthorizedMerchant(merchantId, msg.sender);
-        }
 
-        merchants[merchantId] = merchantAddress;
-        merchantAcquirer[merchantId] = acquirerId;
+        merchantData[merchantId] = MerchantData({merchant: merchantAddress, acquirerId: acquirerId});
         emit MerchantSet(acquirerId, merchantId, merchantAddress);
     }
 
@@ -209,34 +207,11 @@ contract AcquirerConfig is Ownable {
      * @dev Remove a merchant account and its selected acquirer binding.
      * @param merchantAddress Address of the merchant account
      */
-    function removeMerchant(address merchantAddress) external {
-        uint120 merchantId = merchantIdFromAddress(merchantAddress);
-        address currentMerchant = merchants[merchantId];
-        if (currentMerchant == address(0)) revert UnknownMerchant(merchantId);
-        if (currentMerchant != merchantAddress || (msg.sender != owner() && msg.sender != merchantAddress)) {
-            revert UnauthorizedMerchant(merchantId, msg.sender);
-        }
+    function removeMerchant() external {
+        uint120 merchantId = getMerchantId(msg.sender);
 
-        uint48 acquirerId = merchantAcquirer[merchantId];
-        delete merchants[merchantId];
-        delete merchantAcquirer[merchantId];
-        emit MerchantSet(acquirerId, merchantId, address(0));
-    }
-
-    /**
-     * @dev Set terminal address (register, update, or remove) - onlyAcquirer
-     * @param acquirerId The acquirer ID managing this terminal
-     * @param terminalId The terminal ID from EMV data (9F1C) as uint64
-     * @param terminalAddress Address of the terminal swipe fee recipient (use address(0) to remove)
-     */
-    function setTerminal(uint48 acquirerId, uint64 terminalId, address terminalAddress)
-        external
-        onlyAcquirer(acquirerId)
-    {
-        if (terminalId == 0) revert InvalidTerminalId();
-
-        acquirerData[acquirerId].terminals[terminalId] = terminalAddress;
-        emit TerminalSet(acquirerId, terminalId, terminalAddress);
+        delete merchantData[merchantId];
+        emit MerchantRemoved(address(0), merchantId, address(0));
     }
 
     /**
@@ -245,17 +220,8 @@ contract AcquirerConfig is Ownable {
      * @param merchantId The merchant ID as uint120
      * @return merchantAddress The registered address (address(0) if not registered for this acquirer)
      */
-    function getMerchantAddress(uint48 acquirerId, uint120 merchantId) external view returns (address) {
-        return merchantAcquirer[merchantId] == acquirerId ? merchants[merchantId] : address(0);
-    }
-
-    /**
-     * @dev Get the registered address for a merchant ID regardless of selected acquirer.
-     * @param merchantId The merchant ID as uint120
-     * @return merchantAddress The registered address (address(0) if not registered)
-     */
     function getMerchantAddress(uint120 merchantId) external view returns (address) {
-        return merchants[merchantId];
+        return merchantData[merchantId].merchant;
     }
 
     /**
@@ -265,27 +231,7 @@ contract AcquirerConfig is Ownable {
      * @return acquirerId The merchant-selected acquirer
      */
     function getMerchantConfig(uint120 merchantId) external view returns (address merchantAddress, uint48 acquirerId) {
-        return (merchants[merchantId], merchantAcquirer[merchantId]);
-    }
-
-    /**
-     * @dev Get the registered address for a terminal ID
-     * @param acquirerId The acquirer ID as uint48
-     * @param terminalId The terminal ID as uint64
-     * @return terminalAddress The registered address (address(0) if not registered)
-     */
-    function getTerminalAddress(uint48 acquirerId, uint64 terminalId) external view returns (address) {
-        return acquirerData[acquirerId].terminals[terminalId];
-    }
-
-    /**
-     * @dev Check if a merchant is registered under an acquirer
-     * @param acquirerId The acquirer ID as uint48
-     * @param merchantId The merchant ID as uint120
-     * @return isRegistered True if the merchant is registered for this acquirer
-     */
-    function isMerchantRegistered(uint48 acquirerId, uint120 merchantId) external view returns (bool) {
-        return merchantAcquirer[merchantId] == acquirerId && merchants[merchantId] != address(0);
+        return (merchantData[merchantId].merchant, merchantData[merchantId].acquirerId);
     }
 
     /**
@@ -294,17 +240,7 @@ contract AcquirerConfig is Ownable {
      * @return isRegistered True if the merchant is registered
      */
     function isMerchantRegistered(uint120 merchantId) external view returns (bool) {
-        return merchants[merchantId] != address(0);
-    }
-
-    /**
-     * @dev Check if a terminal is registered
-     * @param acquirerId The acquirer ID as uint48
-     * @param terminalId The terminal ID as uint64
-     * @return isRegistered True if the terminal is registered
-     */
-    function isTerminalRegistered(uint48 acquirerId, uint64 terminalId) external view returns (bool) {
-        return acquirerData[acquirerId].terminals[terminalId] != address(0);
+        return merchantData[merchantId].merchant != address(0);
     }
 
     /**
@@ -312,37 +248,13 @@ contract AcquirerConfig is Ownable {
      * @param acquirerId The merchant-selected acquirer ID
      * @param addresses Array of merchant account addresses
      */
-    function batchSetMerchants(uint48 acquirerId, address[] calldata addresses) external onlyOwner {
-        if (acquirerAddresses[acquirerId] == address(0)) revert InvalidAcquirerId();
-
+    function batchSetMerchants(uint48 acquirerId, address[] calldata addresses) external onlyAcquirer(acquirerId) {
         for (uint256 i = 0; i < addresses.length; i++) {
             address merchantAddress = addresses[i];
             uint120 merchantId = merchantIdFromAddress(merchantAddress);
+            if(merchantData[merchantId].merchant != address(0)) revert MerchantAlreadyRegistered(merchantId);
 
             _setMerchant(acquirerId, merchantId, merchantAddress);
-        }
-    }
-
-    /**
-     * @dev Batch set multiple terminals - onlyAcquirer
-     * @param acquirerId The acquirer ID managing these terminals
-     * @param terminalIds Array of terminal IDs as uint64
-     * @param addresses Array of corresponding addresses (use address(0) to remove)
-     */
-    function batchSetTerminals(uint48 acquirerId, uint64[] calldata terminalIds, address[] calldata addresses)
-        external
-        onlyAcquirer(acquirerId)
-    {
-        require(terminalIds.length == addresses.length, "AcquirerConfig: array length mismatch");
-
-        for (uint256 i = 0; i < terminalIds.length; i++) {
-            uint64 terminalId = terminalIds[i];
-            address terminalAddress = addresses[i];
-
-            if (terminalId == 0) revert InvalidTerminalId();
-
-            acquirerData[acquirerId].terminals[terminalId] = terminalAddress;
-            emit TerminalSet(acquirerId, terminalId, terminalAddress);
         }
     }
 
@@ -486,12 +398,6 @@ contract AcquirerConfig is Ownable {
         address _interchangeFeeRecipient = interchangeFeeRecipient;
         address _networkFeeRecipient = networkFeeRecipient;
 
-        // Terminal address only receives the swipe fee; fall back to the acquirer recipient if unset.
-        address terminalAddress = acquirerData[acquirerId].terminals[terminalId];
-        if (terminalAddress == address(0)) {
-            terminalAddress = acquirerFeeRecipient;
-        }
-
         // Calculate all percentage fees on full transaction amount using per-acquirer rates
         uint256 acquirerFeeAmount = (totalAmount * acquirerFeeRate) / ONE_HUNDRED_PERCENT_BP;
         uint256 networkFeeAmount = (totalAmount * networkFeeRate) / ONE_HUNDRED_PERCENT_BP;
@@ -508,7 +414,7 @@ contract AcquirerConfig is Ownable {
 
         // Add swipe fee if non-zero (per-acquirer swipe fee)
         if (swipeFee > 0) {
-            index = _addOrAccumulateFee(feeRecipients, index, terminalAddress, swipeFee);
+            index = _addOrAccumulateFee(feeRecipients, index, acquirerFeeRecipient, swipeFee);
         }
 
         // Add interchange fee if non-zero
