@@ -567,9 +567,12 @@ contract EMVValidator is IValidator {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
-        if (uint256(receivedATC) != currentATC) {
+        // Strictly-increasing (not equal): received >= expected; advancing past it below still blocks replay.
+        if (uint256(receivedATC) < currentATC) {
             revert InvalidATCSequence(uint16(currentATC), receivedATC);
         }
+
+        currentATC = receivedATC;
     }
 
     function _updateReplayProtectionAndATC(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC)
