@@ -255,7 +255,7 @@ contract AcquirerConfig is Ownable {
         feeRecipients = new FeeRecipient[](5);
         uint256 index = 0;
 
-        if(merchant.acquirerId != 0){
+        if (merchant.acquirerId != 0) {
             address acquirerFeeRecipient = acquirerData[acquirerId].acquirerFeeRecipient;
             uint256 acquirerFeeRate = acquirerData[acquirerId].acquirerFeeRate;
             uint256 swipeFee = acquirerData[acquirerId].swipeFee;
