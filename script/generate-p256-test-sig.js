@@ -17,36 +17,29 @@ function normalizeS(s) {
   const pubkeyXHex = '1ccbe91c075fc7f4f033bfa248db8fccd3565de94bbfb12f3c59ff46c271bf83';
   const pubkeyYHex = 'ce4014c68811f9a21a1fdb2c0e6113e06db7ca93b7404e78dc7ccd5ca89a4ca9';
 
-  // Test EMV data: 63-byte packed validator payload
-  const ARQC = '1234567890ABCDEF'; // 8 bytes
-  const UN = '12345678'; // 4 bytes
-  const ATC = '0000'; // 2 bytes
-  const Amount = '000000010000'; // 6 bytes (BCD format: n12)
-  const Currency = '0840'; // 2 bytes (BCD format: n3, 840 = USD per ISO 4217)
-  const Date = '231201'; // 3 bytes
-  const TxnType = '00'; // 1 byte
-  const TVR = '0000000000'; // 5 bytes
-  const CVMResults = '000000'; // 3 bytes
-  const TerminalId = '5445535430303100'; // 8 bytes
-  const MerchantId = '4D45524348414E5430303132333400'; // 15 bytes
-  const AcquirerId = '414351554952'; // 6 bytes
+  // 52-byte ATC(2) || PDOL(50) slice-from-front message.
+  const ATC = '0000';                 // 9F36 off 0  (2)
+  const UN = '12345678';              // 9F37 off 2  (4)
+  const TxnType = '00';               // 9C   off 6  (1)
+  const Currency = '0840';            // 5F2A off 7  (2)
+  const Amount = '000000010000';      // 9F02 off 9  (6)
+  const AmountOther = '000000000000'; // 9F03 off 15 (6)
+  const CurrencyExp = '02';           // 5F36 off 21 (1)
+  const MerchantId = '4D45524348414E5430303132333400'; // 9F16 off 22 (15)
+  const TerminalId = '5445535430303100';                // 9F1C off 37 (8)
+  const CountryCode = '0840';         // 9F1A off 45 (2)
+  const Date = '231201';              // 9A   off 47 (3)
+  const MCC = '5999';                 // 9F15 off 50 (2)
 
   const signedData = Buffer.from(
-    ARQC +
-    UN +
-    ATC +
-    Amount +
-    Currency +
-    Date +
-    TxnType +
-    TVR +
-    CVMResults +
-    TerminalId +
-    MerchantId +
-    AcquirerId,
+    ATC + UN + TxnType + Currency + Amount + AmountOther + CurrencyExp +
+    MerchantId + TerminalId + CountryCode + Date + MCC,
     'hex'
   );
-  console.log('Signed data (63 bytes):', signedData.toString('hex'));
+  if (signedData.length !== 52) {
+    throw new Error('expected 52-byte message, got ' + signedData.length);
+  }
+  console.log('Signed data (52 bytes):', signedData.toString('hex'));
 
   const hash = crypto.createHash('sha256').update(signedData).digest();
   console.log('SHA-256 hash:', hash.toString('hex'));

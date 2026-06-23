@@ -50,14 +50,17 @@ contract EMVValidator is IValidator {
 
     uint256 private constant ATC_MAX = type(uint16).max;
     // The signed message is exactly what the JavaCard applet signs at GPO:
-    // ATC(2) || PDOL(59) = 61 bytes (see emv-card-sim PaymentApplication.java
+    // ATC(2) || PDOL(50) = 52 bytes (see emv-card-sim PaymentApplication.java
     // generateEcdsaAtGpo + profiles/default.yaml canonical PDOL). The contract
     // hashes the whole message with SHA-256 and P256-verifies; replay fields are
     // read from fixed offsets within it.
-    uint256 private constant EMV_FIELDS_LENGTH = 61;
+    uint256 private constant EMV_FIELDS_LENGTH = 52;
 
-    // Offsets within the 61-byte ATC(2) || PDOL(59) slice-from-front message. The P-256 signature
-    // covers all 61 bytes; this records which signed fields the contracts also *enforce*, and where:
+    // Offsets within the 52-byte ATC(2) || PDOL(50) slice-from-front message. The P-256 signature
+    // covers all 52 bytes; this records which signed fields the contracts also *enforce*, and where.
+    // 9F01 (acquirer) and 9F21 (time) are NOT signed: terminals cannot reliably supply a real
+    // acquirer at GPO, and time drifts between GPO signing and host reconstruction. Settlement
+    // derives the acquirer from the signed merchant ID instead.
     //   off  len  tag    field                          enforced by
     //   0    2    9F36   ATC (card-prefixed)            EMVValidator (replay)
     //   2    4    9F37   Unpredictable Number           EMVValidator (replay)
@@ -67,12 +70,10 @@ contract EMVValidator is IValidator {
     //   15   6    9F03   Amount, Other                  EMVValidator (_validateAuxiliaryFields)
     //   21   1    5F36   Transaction Currency Exponent  EMVValidator (_validateAuxiliaryFields)
     //   22   15   9F16   Merchant Identifier            EMVSettlement (routing)
-    //   37   8    9F1C   Terminal Identification        EMVSettlement (routing)
-    //   45   6    9F01   Acquirer Identifier            EMVSettlement (routing)
-    //   51   2    9F1A   Terminal Country Code          advisory (signed only)
-    //   53   3    9A     Transaction Date               advisory (signed only)
-    //   56   2    9F15   Merchant Category Code         advisory (signed only)
-    //   58   3    9F21   Transaction Time               advisory (signed only)
+    //   37   8    9F1C   Terminal Identification        advisory (signed only)
+    //   45   2    9F1A   Terminal Country Code          advisory (signed only)
+    //   47   3    9A     Transaction Date               advisory (signed only)
+    //   50   2    9F15   Merchant Category Code         advisory (signed only)
     uint256 private constant TXN_TYPE_OFFSET = 6;
     uint256 private constant AMOUNT_OTHER_OFFSET = 15;
     uint256 private constant CURRENCY_EXP_OFFSET = 21;
@@ -397,8 +398,7 @@ contract EMVValidator is IValidator {
         // Skip target(20) bytes to get to inner calldata
         uint256 innerCalldataStart = executionDataStart + 20;
 
-        // Inner calldata structure (ABI encoded): selector(4) + offset(32) + length(32) + emvFields
-        // Skip selector(4) + offset(32) + length(32) = 68 bytes
+        // Inner = execute(bytes): selector(4) + offset(32) + length(32) + emvData. Skip 68 to emvData.
         uint256 emvDataStart = innerCalldataStart + 68;
         uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 36:innerCalldataStart + 68]));
 
@@ -443,9 +443,9 @@ contract EMVValidator is IValidator {
         pure
         returns (uint256 unpredictableNumberOffset, uint256 atcOffset, uint256 amountOffset, uint256 currencyOffset)
     {
-        // Replay/currency offsets within the 61-byte ATC(2) || PDOL(59) signed message. The full
+        // Replay/currency offsets within the 52-byte ATC(2) || PDOL(50) signed message. The full
         // signed-field map — including the type / amount-other / currency-exponent fields enforced
-        // in _validateAuxiliaryFields and the merchant/terminal/acquirer fields EMVSettlement reads —
+        // in _validateAuxiliaryFields and the merchant/terminal fields EMVSettlement reads —
         // is tabulated at the offset constants near EMV_FIELDS_LENGTH.
         // returns (unpredictableNumberOffset, atcOffset, amountOffset, currencyOffset) = (2, 0, 9, 7)
         if (emvFields.length == EMV_FIELDS_LENGTH) {
@@ -467,7 +467,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract ATC (2 bytes) from packed EMV fields - Assembly optimized
-     * Offset 0 of the 61-byte ATC(2)||PDOL(59) message. This is the pre-increment
+     * Offset 0 of the 52-byte ATC(2)||PDOL(50) message. This is the pre-increment
      * ATC the applet signs at GPO (N); replay state tracks N then advances to N+1.
      */
     function _extractATC(bytes calldata emvFields) internal pure returns (bytes2 result) {
@@ -479,7 +479,7 @@ contract EMVValidator is IValidator {
 
     /**
      * @dev Extract currency (2 bytes) from packed EMV fields - Assembly optimized
-     * 5F2A at offset 16 of the 61-byte message (PDOL offset 14).
+     * 5F2A at offset 7 of the 52-byte message.
      */
     function _extractCurrency(bytes calldata emvFields) internal pure returns (bytes2 result) {
         (,,, uint256 currencyOffset) = _emvFieldOffsets(emvFields);
@@ -493,10 +493,10 @@ contract EMVValidator is IValidator {
      * @param emvFields The EMV fields calldata to extract currency from
      */
     function _validateCurrencyCode(bytes calldata emvFields) internal pure {
-        // Accept both BCD-style n3 encoding and uint16 numeric encoding used by local fixtures.
+        // Accept only canonical EMV n3 BCD-style encoding for USD (840) or USN (997).
         bytes2 currencyBytes = _extractCurrency(emvFields);
         uint16 currency = uint16(currencyBytes);
-        if (currency != 0x0840 && currency != 0x0997 && currency != 840 && currency != 997) {
+        if (currency != 0x0840 && currency != 0x0997) {
             revert InvalidCurrencyCode(currency);
         }
     }
@@ -504,10 +504,10 @@ contract EMVValidator is IValidator {
     /**
      * @dev Enforce the card-signed "validated" fields the settlement does not consume:
      * 9C transaction type, 9F03 amount-other, 5F36 currency exponent. The P-256 signature already
-     * binds all 61 bytes; this records which signed values the contract accepts (pilot policy:
+     * binds all 52 bytes; this records which signed values the contract accepts (pilot policy:
      * purchases only, no secondary amount, USD/USN minor units). Runs before signature verification,
      * alongside the currency check, so an unsupported field fails fast with a precise error.
-     * @param emvFields The 61-byte EMV fields calldata
+     * @param emvFields The 52-byte EMV fields calldata
      */
     function _validateAuxiliaryFields(bytes calldata emvFields) internal pure {
         // 9C Transaction Type @ 6 — purchase (0x00) only.
@@ -605,7 +605,7 @@ contract EMVValidator is IValidator {
         view
         returns (bool)
     {
-        // emvFields IS the applet's signed message: ATC(2) || PDOL(59) = 61 bytes,
+        // emvFields IS the applet's signed message: ATC(2) || PDOL(50) = 52 bytes,
         // with no TLV framing. The applet signs SHA-256(message) with ECDSA-P256
         // (ALG_ECDSA_SHA_256), emitting raw r||s. Hash the whole message and verify.
         bytes32 messageHash = sha256(emvFields);

@@ -102,19 +102,15 @@ contract EMVSettlement is Ownable {
     // ========== SETTLEMENT FUNCTIONS ==========
 
     /**
-     * @dev Main entry point: Execute EMV-based ERC20 transfer using validated EMV data
-     * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
+     * @dev Execute the ERC20 transfer for a validated EMV transaction. The acquirer is derived
+     *      on-chain from the card-signed merchant ID, not passed in.
+     * @param emvData The card-signed message (the bytes the UserOp signature covers).
      */
     function execute(bytes calldata emvData) external payable {
-        (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset) =
-            _emvSettlementOffsets(emvData);
+        (uint256 amountOffset, uint256 merchantOffset) = _emvSettlementOffsets(emvData);
 
         bytes calldata amountBytes = emvData[amountOffset:amountOffset + 6];
-        uint64 terminalId = uint64(bytes8(emvData[terminalOffset:terminalOffset + 8]));
         uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
-        uint48 acquirerId = acquirerOffset == 0
-            ? uint48(0x414351554952)  // "ACQUIR" in compact 40-byte payloads.
-            : uint48(bytes6(emvData[acquirerOffset:acquirerOffset + 6]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -123,9 +119,9 @@ contract EMVSettlement is Ownable {
             revert InvalidAmount();
         }
 
-        // Get payment distribution from acquirer config (includes all 4 fees + merchant)
+        // Distribution — AcquirerConfig derives the acquirer on-chain from the card-signed merchant ID.
         AcquirerConfig.FeeRecipient[] memory feeRecipients =
-            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, acquirerId, transferAmount);
+            acquirerConfig.calculatePaymentDistribution(merchantId, transferAmount);
 
         // Process payments to all recipients
         _processFeePayments(feeRecipients, transferAmount);
@@ -152,21 +148,12 @@ contract EMVSettlement is Ownable {
     function _emvSettlementOffsets(bytes calldata emvData)
         internal
         pure
-        returns (uint256 amountOffset, uint256 terminalOffset, uint256 merchantOffset, uint256 acquirerOffset)
+        returns (uint256 amountOffset, uint256 merchantOffset)
     {
-        if (emvData.length == 40) {
-            return (3, 13, 21, 0);
-        }
-
-        if (emvData.length == 63) {
-            return (14, 34, 42, 57);
-        }
-
-        // 61-byte ATC(2) || PDOL(59) message (slice-from-front, matches EMVValidator):
-        //   9F02 amount @ 9, 9F16 merchant @ 22, 9F1C terminal @ 37, 9F01 acquirer @ 45.
-        // acquirerOffset is non-zero, so the real 9F01 is read (no hardcoded fallback).
-        if (emvData.length == 61) {
-            return (9, 37, 22, 45);
+        // 52-byte ATC(2) || PDOL(50) slice-from-front message. 9F01 (acquirer) and 9F21 (time)
+        // are not signed; the merchant-selected acquirer is derived on-chain from 9F16.
+        if (emvData.length == 52) {
+            return (9, 22);
         }
 
         revert InvalidBCDLength();
