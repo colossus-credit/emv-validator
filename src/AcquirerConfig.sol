@@ -7,7 +7,8 @@ import {Ownable} from "solady/auth/Ownable.sol";
 /**
  * @title AcquirerConfig
  * @dev Registry for merchant-selected acquirers with acquirer, swipe, interchange, and network fees.
- * @notice Merchant IDs are the low 15 bytes of the merchant account address.
+ * @notice Merchant IDs are merchant-chosen 15-byte identifiers (e.g. a 15-char ASCII id carried in
+ *         EMV tag 9F16) bound to the registrant's address via setMerchant; first-come, no anti-squat.
  */
 contract AcquirerConfig is Ownable {
     struct FeeRecipient {
@@ -127,15 +128,10 @@ contract AcquirerConfig is Ownable {
         emit AcquirerSet(acquirerId, acquirerAddress);
     }
 
-    function getMerchantId(address merchantAddress) public pure returns (uint120 merchantId) {
-        merchantId = uint120(uint160(merchantAddress));
-        if (merchantId == 0) revert InvalidMerchantId();
-    }
-
-    function setMerchant(uint48 acquirerId) external {
+    function setMerchant(uint120 merchantId, uint48 acquirerId) external {
         if (acquirers[acquirerId] == address(0)) revert InvalidAcquirerId();
+        if (merchantId == 0) revert InvalidMerchantId();
 
-        uint120 merchantId = getMerchantId(msg.sender);
         address currentMerchant = merchantData[merchantId].merchant;
         if (currentMerchant != address(0) && currentMerchant != msg.sender) {
             revert UnauthorizedMerchant(merchantId, msg.sender);
@@ -145,8 +141,7 @@ contract AcquirerConfig is Ownable {
         emit MerchantSet(acquirerId, merchantId, msg.sender);
     }
 
-    function removeMerchant() external {
-        uint120 merchantId = getMerchantId(msg.sender);
+    function removeMerchant(uint120 merchantId) external {
         MerchantData memory merchant = merchantData[merchantId];
         if (merchant.merchant == address(0)) revert UnknownMerchant(merchantId);
         if (merchant.merchant != msg.sender) revert UnauthorizedMerchant(merchantId, msg.sender);

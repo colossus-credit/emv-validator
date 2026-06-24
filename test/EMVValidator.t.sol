@@ -120,7 +120,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses its acquirer.
         vm.prank(merchantAddress);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(merchantIdFromAddress(merchantAddress), testAcquirerId);
 
         // Deploy settlement contract with configuration
         emvSettlement = new EMVSettlement(
@@ -494,7 +494,7 @@ contract EMVValidatorTest is KernelTestBase {
         // Reuse the configured acquirer; register the attacker's merchant under it so the signature
         // over the merchant routing field is the only thing standing between the attacker and funds.
         vm.prank(attackerMerchant);
-        acquirerConfig.setMerchant(attackerAcquirerId);
+        acquirerConfig.setMerchant(attackerMerchantId, attackerAcquirerId);
 
         bytes memory reroutedFields = _createEMVFields();
         // Slice-from-front offsets: 9F16 Merchant @ 22, 9F1C Terminal @ 37.
@@ -689,7 +689,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses this acquirer.
         vm.prank(testMerchantAddress);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(merchantId, testAcquirerId);
 
         // Check registration
         assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
@@ -700,7 +700,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Test removal
         vm.prank(testMerchantAddress);
-        acquirerConfig.removeMerchant();
+        acquirerConfig.removeMerchant(merchantId);
         assertFalse(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
         assertFalse(acquirerConfig.isMerchantRegistered(merchantId));
         assertEq(acquirerConfig.getMerchantAddress(merchantId), address(0));
@@ -718,17 +718,17 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setAcquirer(secondAcquirerId, address(this));
 
         vm.prank(merchant);
-        acquirerConfig.setMerchant(firstAcquirerId);
+        acquirerConfig.setMerchant(merchantId, firstAcquirerId);
         (, uint48 selectedAcquirerId) = acquirerConfig.getMerchantConfig(merchantId);
         assertEq(selectedAcquirerId, firstAcquirerId);
 
         vm.prank(attacker);
-        acquirerConfig.setMerchant(secondAcquirerId);
+        acquirerConfig.setMerchant(merchantIdFromAddress(attacker), secondAcquirerId);
         (, selectedAcquirerId) = acquirerConfig.getMerchantConfig(merchantId);
         assertEq(selectedAcquirerId, firstAcquirerId);
 
         vm.prank(merchant);
-        acquirerConfig.setMerchant(secondAcquirerId);
+        acquirerConfig.setMerchant(merchantId, secondAcquirerId);
         assertEq(acquirerConfig.getMerchantAddress(merchantId), merchant);
         (, selectedAcquirerId) = acquirerConfig.getMerchantConfig(merchantId);
         assertEq(selectedAcquirerId, secondAcquirerId);
@@ -746,19 +746,19 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setAcquirer(firstAcquirerId, address(this));
         acquirerConfig.setAcquirer(secondAcquirerId, address(this));
         vm.prank(merchant);
-        acquirerConfig.setMerchant(firstAcquirerId);
+        acquirerConfig.setMerchant(merchantId, firstAcquirerId);
 
         vm.prank(collidingMerchant);
         vm.expectRevert(
             abi.encodeWithSelector(AcquirerConfig.UnauthorizedMerchant.selector, merchantId, collidingMerchant)
         );
-        acquirerConfig.setMerchant(secondAcquirerId);
+        acquirerConfig.setMerchant(merchantId, secondAcquirerId);
 
         vm.prank(collidingMerchant);
         vm.expectRevert(
             abi.encodeWithSelector(AcquirerConfig.UnauthorizedMerchant.selector, merchantId, collidingMerchant)
         );
-        acquirerConfig.removeMerchant();
+        acquirerConfig.removeMerchant(merchantId);
 
         assertEq(acquirerConfig.getMerchantAddress(merchantId), merchant);
         (, uint48 selectedAcquirerId) = acquirerConfig.getMerchantConfig(merchantId);
@@ -782,7 +782,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses this acquirer
         vm.prank(testMerchant);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(testMerchantId, testAcquirerId);
 
         // Test payment distribution calculation
         uint256 totalAmount = 10 ether;
@@ -846,7 +846,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses this acquirer.
         vm.prank(testMerchantAddress);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(testMerchantId, testAcquirerId);
 
         // Test payment distribution - should accumulate fees for shared recipient
         uint256 totalAmount = 100 ether;
@@ -910,7 +910,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses this acquirer.
         vm.prank(merchantRecipient);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(testMerchantId, testAcquirerId);
 
         // Test payment distribution - should have 4 separate recipients (acquirer gets percentage + swipe)
         uint256 totalAmount = 100 ether;
@@ -973,10 +973,9 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Merchant chooses this acquirer.
         vm.prank(merchantAddr);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(testMerchantId, testAcquirerId);
 
         // Test merchant-derived ID helpers
-        assertEq(acquirerConfig.getMerchantId(merchantAddr), testMerchantId);
         assertEq(acquirerConfig.getMerchantAddress(testMerchantId), merchantAddr);
         (address configuredMerchant, uint48 configuredAcquirerId) = acquirerConfig.getMerchantConfig(testMerchantId);
         assertEq(configuredMerchant, merchantAddr);
@@ -998,7 +997,7 @@ contract EMVValidatorTest is KernelTestBase {
         uint120 merchantId = merchantIdFromAddress(merchant);
 
         vm.prank(merchant);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(merchantId, testAcquirerId);
 
         assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
         assertEq(acquirerConfig.getMerchantAddress(merchantId), merchant);
@@ -1009,7 +1008,7 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setAcquirer(testAcquirerId, address(this));
 
         vm.expectRevert(AcquirerConfig.InvalidMerchantId.selector);
-        acquirerConfig.getMerchantId(address(0));
+        acquirerConfig.setMerchant(0, testAcquirerId);
     }
 
     function test_AcquirerConfigInvalidIds() public {
@@ -1018,7 +1017,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Test invalid merchant ID
         vm.expectRevert(AcquirerConfig.InvalidMerchantId.selector);
-        acquirerConfig.getMerchantId(address(0));
+        acquirerConfig.setMerchant(0, testAcquirerId);
     }
 
     function test_AcquirerConfigUnauthorizedAccess() public {
@@ -1050,7 +1049,7 @@ contract EMVValidatorTest is KernelTestBase {
         vm.startPrank(unauthorized);
 
         vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(merchantIdFromAddress(unauthorized), testAcquirerId);
 
         vm.stopPrank();
     }
@@ -1060,7 +1059,7 @@ contract EMVValidatorTest is KernelTestBase {
         uint48 unregisteredAcquirerId = 999;
 
         vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
-        acquirerConfig.setMerchant(unregisteredAcquirerId);
+        acquirerConfig.setMerchant(merchantIdFromAddress(address(this)), unregisteredAcquirerId);
     }
 
     function test_AcquirerConfigFeeRateValidation() public {
@@ -1305,7 +1304,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Try to set merchant for unregistered acquirer - should hit InvalidAcquirerId at line 77-78
         vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
-        acquirerConfig.setMerchant(unregisteredAcquirer);
+        acquirerConfig.setMerchant(merchantIdFromAddress(address(this)), unregisteredAcquirer);
     }
 
     function test_EMVSettlementOnUninstallCoverage() public {
@@ -1401,7 +1400,7 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setNetworkFee(makeAddr("network"), 0); // No network fee
         acquirerConfig.setInterchangeFee(makeAddr("interchange"), 0); // No interchange fee
         vm.prank(merchant);
-        acquirerConfig.setMerchant(testAcquirerId);
+        acquirerConfig.setMerchant(testMerchantId, testAcquirerId);
 
         // This should work since all fees are 0, so no fee recipients are added
         AcquirerConfig.FeeRecipient[] memory result =
@@ -1496,7 +1495,7 @@ contract EMVValidatorTest is KernelTestBase {
         testConfig.setInterchangeFee(address(this), 0);
 
         uint120 merchantId = merchantIdFromAddress(address(this));
-        testConfig.setMerchant(newAcquirer);
+        testConfig.setMerchant(merchantId, newAcquirer);
 
         AcquirerConfig.FeeRecipient[] memory feeRec = testConfig.calculatePaymentDistribution(merchantId, 1 ether);
 
@@ -1751,7 +1750,7 @@ contract EMVValidatorTest is KernelTestBase {
         acquirerConfig.setAcquirerFee(e2eAcquirerId, address(this), 25); // 0.25%
         acquirerConfig.setSwipeFee(e2eAcquirerId, 50 * 10 ** 16); // $0.50
         vm.prank(e2eMerchant);
-        acquirerConfig.setMerchant(e2eAcquirerId);
+        acquirerConfig.setMerchant(merchantIdFromAddress(e2eMerchant), e2eAcquirerId);
 
         console.log("=== Acquirer Configuration Complete ===");
 
