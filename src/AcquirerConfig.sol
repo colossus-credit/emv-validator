@@ -2,6 +2,7 @@
 
 pragma solidity ^0.8.23;
 
+import {ANSEncoding} from "./ANSEncoding.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 
 /**
@@ -31,6 +32,7 @@ contract AcquirerConfig is Ownable {
     uint256 private constant ACQUIRER_FEE_MAX_BP = 30;
     uint256 private constant NETWORK_FEE_MAX_BP = 15;
     uint256 private constant INTERCHANGE_FEE_MAX_BP = 250;
+    uint256 private constant MERCHANT_ID_MAX_LENGTH = 15;
 
     mapping(uint48 => address) public acquirers;
     mapping(uint48 => AcquirerData) private acquirerData;
@@ -62,6 +64,7 @@ contract AcquirerConfig is Ownable {
 
     error InvalidAcquirerId();
     error InvalidMerchantId();
+    error InvalidMerchantIdLength(uint256 length);
     error InvalidFeeRate();
     error InvalidFee(uint256 position);
     error InvalidMerchantFee();
@@ -129,6 +132,18 @@ contract AcquirerConfig is Ownable {
     }
 
     function setMerchant(uint120 merchantId, uint48 acquirerId) external {
+        _setMerchant(merchantId, acquirerId);
+    }
+
+    function setMerchant(string calldata merchantIdANSString, uint48 acquirerId) external {
+        bytes memory encodedMerchantId = ANSEncoding.encode(merchantIdANSString);
+        uint256 length = encodedMerchantId.length;
+        if (length > MERCHANT_ID_MAX_LENGTH) revert InvalidMerchantIdLength(length);
+
+        _setMerchant(uint120(bytes15(encodedMerchantId)), acquirerId);
+    }
+
+    function _setMerchant(uint120 merchantId, uint48 acquirerId) internal {
         if (acquirers[acquirerId] == address(0)) revert InvalidAcquirerId();
         if (merchantId == 0) revert InvalidMerchantId();
 
