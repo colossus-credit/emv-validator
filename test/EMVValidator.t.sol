@@ -5,6 +5,7 @@ import "lib/kernel/test/base/KernelTestBase.sol";
 import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
+import {ANSEncoding} from "../src/ANSEncoding.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "kernel/src/types/Constants.sol";
 import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
@@ -704,6 +705,77 @@ contract EMVValidatorTest is KernelTestBase {
         assertFalse(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
         assertFalse(acquirerConfig.isMerchantRegistered(merchantId));
         assertEq(acquirerConfig.getMerchantAddress(merchantId), address(0));
+    }
+
+    function test_AcquirerConfigSetMerchantWithANSString() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        address testMerchantAddress = makeAddr("merchantWithStringId");
+        uint120 merchantId = bytesToUint120(bytes15("Merchant001234"));
+
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        vm.prank(testMerchantAddress);
+        acquirerConfig.setMerchant("Merchant001234", testAcquirerId);
+
+        assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertTrue(acquirerConfig.isMerchantRegistered(merchantId));
+        assertEq(acquirerConfig.getMerchantAddress(merchantId), testMerchantAddress);
+        (, uint48 selectedAcquirerId) = acquirerConfig.getMerchantConfig(merchantId);
+        assertEq(selectedAcquirerId, testAcquirerId);
+    }
+
+    function test_AcquirerConfigSetMerchantWithSpecialANSString() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        address testMerchantAddress = makeAddr("merchantWithSpecialStringId");
+        uint120 merchantId = bytesToUint120(bytes15("MERCH-1_$~!"));
+
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        vm.prank(testMerchantAddress);
+        acquirerConfig.setMerchant("MERCH-1_$~!", testAcquirerId);
+
+        assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertEq(acquirerConfig.getMerchantAddress(merchantId), testMerchantAddress);
+    }
+
+    function test_AcquirerConfigSetMerchantWithMaxLengthANSString() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        address testMerchantAddress = makeAddr("merchantWithLongStringId");
+        uint120 merchantId = bytesToUint120(bytes15("abcDEF012345678"));
+
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        vm.prank(testMerchantAddress);
+        acquirerConfig.setMerchant("abcDEF012345678", testAcquirerId);
+
+        assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertEq(acquirerConfig.getMerchantAddress(merchantId), testMerchantAddress);
+    }
+
+    function test_AcquirerConfigRejectsTooLongANSMerchantId() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        vm.expectRevert(abi.encodeWithSelector(AcquirerConfig.InvalidMerchantIdLength.selector, 16));
+        acquirerConfig.setMerchant("1234567890123456", testAcquirerId);
+    }
+
+    function test_AcquirerConfigRejectsInvalidANSMerchantIdCharacter() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        string memory invalidMerchantId = string(abi.encodePacked("MERCHANT", bytes1(0x1F)));
+
+        vm.expectRevert(abi.encodeWithSelector(ANSEncoding.InvalidANSCharacter.selector, bytes1(0x1F)));
+        acquirerConfig.setMerchant(invalidMerchantId, testAcquirerId);
+    }
+
+    function test_AcquirerConfigRejectsEmptyANSMerchantId() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+
+        vm.expectRevert(AcquirerConfig.InvalidMerchantId.selector);
+        acquirerConfig.setMerchant("", testAcquirerId);
     }
 
     function test_MerchantControlsSelectedAcquirer() public {
