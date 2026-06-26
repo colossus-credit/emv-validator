@@ -8,6 +8,7 @@ import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {EMVCardPolicy} from "../src/policy/EMVCardPolicy.sol";
 import {EMVLimitPolicy} from "../src/policy/EMVLimitPolicy.sol";
 import {ANSEncoding} from "../src/util/ANSEncoding.sol";
+import {EMVCallData} from "../src/util/EMVCallData.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "kernel/src/types/Constants.sol";
 import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
@@ -302,6 +303,28 @@ contract EMVSignerTest is KernelTestBase {
 
     function _installKernelEMVCardPolicy() internal {
         _installEMVCardPolicyFor(address(kernel), _emvPermissionKey(), 0, TEST_PUBKEY_X, TEST_PUBKEY_Y);
+    }
+
+    function _uninstallEMVCardPolicyFor(address account, bytes32 permission) internal {
+        vm.prank(account);
+        emvCardPolicy.onUninstall(abi.encodePacked(permission));
+    }
+
+    function _installEMVLimitPolicyFor(address account, bytes32 permission, uint64 cycleMax, uint64 perTxnMax)
+        internal
+    {
+        vm.prank(account);
+        emvLimitPolicy.onInstall(abi.encodePacked(permission, abi.encode(cycleMax, perTxnMax)));
+    }
+
+    function _uninstallEMVLimitPolicyFor(address account, bytes32 permission) internal {
+        vm.prank(account);
+        emvLimitPolicy.onUninstall(abi.encodePacked(permission));
+    }
+
+    function _assertKernelCardReplayState(uint256 expectedATC, bytes4 unpredictableNumber, bool used) internal view {
+        assertEq(emvCardPolicy.getExpectedATC(address(kernel), _testKeyHash()), expectedATC);
+        assertEq(emvCardPolicy.isUnpredictableNumberUsed(address(kernel), _testKeyHash(), unpredictableNumber), used);
     }
 
     function _callPolicyInstallData(address target, bytes4 selector) internal pure returns (bytes memory) {
@@ -1168,6 +1191,204 @@ contract EMVSignerTest is KernelTestBase {
 
         assertEq(mockERC20.balanceOf(attacker), stolenAmount);
         assertEq(mockERC20.balanceOf(merchantAddress), merchantBalanceBefore);
+    }
+
+    function testFuzz_EMVCardPolicyMalformedSignatureLengthDoesNotMutateReplayState(uint8 signatureLength)
+        public
+        whenInitialized
+    {
+        vm.assume(signatureLength != 160);
+        _installKernelEMVCardPolicy();
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = new bytes(signatureLength);
+
+        vm.prank(address(kernel));
+        vm.expectRevert(abi.encodeWithSelector(EMVCardPolicy.InvalidSignatureLength.selector, uint256(signatureLength)));
+        emvCardPolicy.checkUserOpPolicy(_emvPermissionKey(), op);
+
+        _assertKernelCardReplayState(0, bytes4(TEST_UNPREDICTABLE_NUMBER), false);
+    }
+
+    function testFuzz_EMVCardPolicyMalformedEMVFieldLengthDoesNotMutateReplayState(uint8 fieldLength)
+        public
+        whenInitialized
+    {
+        vm.assume(fieldLength != 52);
+        _installKernelEMVCardPolicy();
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall(new bytes(fieldLength));
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        vm.expectRevert(abi.encodeWithSelector(EMVCallData.InvalidEMVFieldLength.selector, uint256(fieldLength)));
+        emvCardPolicy.checkUserOpPolicy(_emvPermissionKey(), op);
+
+        _assertKernelCardReplayState(0, bytes4(TEST_UNPREDICTABLE_NUMBER), false);
+    }
+
+    function test_EMVCardPolicyCheckSignatureRejectsWrongKeyAndMalformedLength() public {
+        _installEMVCardPolicyFor(address(this), _emvPermissionKey(), 0, TEST_PUBKEY_X, TEST_PUBKEY_Y);
+
+        bytes32 signedPayloadHash = _signedPayloadHash();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(EMVCardPolicy.UnexpectedPublicKey.selector, _testKeyHash(), _otherKeyHash())
+        );
+        emvCardPolicy.checkSignaturePolicy(
+            _emvPermissionKey(),
+            address(this),
+            signedPayloadHash,
+            _createEMVSignatureForKey(OTHER_PUBKEY_X, OTHER_PUBKEY_Y)
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(EMVCardPolicy.InvalidSignatureLength.selector, uint256(4)));
+        emvCardPolicy.checkSignaturePolicy(_emvPermissionKey(), address(this), signedPayloadHash, hex"deadbeef");
+    }
+
+    function test_EMVCardPolicyUninstallClearsPermissionMappingAndBlocksPolicyUse() public whenInitialized {
+        _installKernelEMVCardPolicy();
+        _uninstallEMVCardPolicyFor(address(kernel), _emvPermissionKey());
+
+        assertEq(emvCardPolicy.getPermissionKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
+        assertTrue(emvCardPolicy.isPublicKeyRegistered(address(kernel), _testKeyHash()));
+        _assertKernelCardReplayState(0, bytes4(TEST_UNPREDICTABLE_NUMBER), false);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        vm.expectRevert(EMVCardPolicy.PublicKeyNotRegistered.selector);
+        emvCardPolicy.checkUserOpPolicy(_emvPermissionKey(), op);
+    }
+
+    function test_EMVCardPolicyReinstallSwitchesPermissionKey() public whenInitialized {
+        _installKernelEMVCardPolicy();
+        _installEMVCardPolicyFor(address(kernel), _emvPermissionKey(), 0, OTHER_PUBKEY_X, OTHER_PUBKEY_Y);
+
+        assertEq(emvCardPolicy.getPermissionKeyHash(address(kernel), _emvPermissionKey()), _otherKeyHash());
+        assertTrue(emvCardPolicy.isPublicKeyRegistered(address(kernel), _testKeyHash()));
+        assertTrue(emvCardPolicy.isPublicKeyRegistered(address(kernel), _otherKeyHash()));
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        vm.expectRevert(
+            abi.encodeWithSelector(EMVCardPolicy.UnexpectedPublicKey.selector, _otherKeyHash(), _testKeyHash())
+        );
+        emvCardPolicy.checkUserOpPolicy(_emvPermissionKey(), op);
+    }
+
+    function test_EMVLimitPolicyFailedValidationDoesNotMutateCycleTotal() public whenInitialized {
+        bytes32 permission = _emvPermissionKey();
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+
+        _installEMVLimitPolicyFor(address(kernel), permission, type(uint64).max, 9_999);
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_FAILED_UINT);
+        (,, uint64 cycleTotal,) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(cycleTotal, 0);
+
+        _installEMVLimitPolicyFor(address(kernel), permission, 9_999, type(uint64).max);
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_FAILED_UINT);
+        (,, cycleTotal,) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(cycleTotal, 0);
+
+        _installEMVLimitPolicyFor(address(kernel), permission, type(uint64).max, type(uint64).max);
+        op.callData = _encodeSimpleTransferCall(_createEMVFieldsWithByte(6, bytes1(0x09)));
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_FAILED_UINT);
+        (,, cycleTotal,) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(cycleTotal, 0);
+    }
+
+    function test_EMVLimitPolicyCycleTotalResetsAfterCycleWindow() public whenInitialized {
+        bytes32 permission = _emvPermissionKey();
+        _installEMVLimitPolicyFor(address(kernel), permission, 15_000, type(uint64).max);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_SUCCESS_UINT);
+
+        (uint64 firstCycle,, uint64 cycleTotal,) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(cycleTotal, 10_000);
+
+        vm.warp(uint256(firstCycle) + 1 days);
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_SUCCESS_UINT);
+
+        (uint64 secondCycle,, uint64 secondCycleTotal,) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(secondCycle, firstCycle + 1 days);
+        assertEq(secondCycleTotal, 10_000);
+    }
+
+    function test_EMVLimitPolicyUninstallClearsLimitsAndFailsClosed() public whenInitialized {
+        bytes32 permission = _emvPermissionKey();
+        _installEMVLimitPolicyFor(address(kernel), permission, 15_000, type(uint64).max);
+
+        _uninstallEMVLimitPolicyFor(address(kernel), permission);
+        (, uint64 cycleMax, uint64 cycleTotal, uint64 perTxnMax) = emvLimitPolicy.getLimits(address(kernel), permission);
+        assertEq(cycleMax, 0);
+        assertEq(cycleTotal, 0);
+        assertEq(perTxnMax, 0);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        vm.prank(address(kernel));
+        assertEq(emvLimitPolicy.checkUserOpPolicy(permission, op), SIG_VALIDATION_FAILED_UINT);
+    }
+
+    function test_EMVSignerRejectsTamperedSignatureKeyEnvelope() public whenInitialized {
+        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        KernelUserOp memory op;
+        op.sender = address(this);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = abi.encodePacked(_testKeyHash(), OTHER_PUBKEY_X, OTHER_PUBKEY_Y, TEST_SIGNATURE);
+
+        vm.expectRevert(EMVSigner.InvalidPublicKey.selector);
+        emvSigner.validateUserOp(op, bytes32(0));
+    }
+
+    function test_EMVSignerRejectsUnauthorizedSignatureKeyEnvelope() public whenInitialized {
+        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        KernelUserOp memory op;
+        op.sender = address(this);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignatureForKey(OTHER_PUBKEY_X, OTHER_PUBKEY_Y);
+
+        vm.expectRevert(EMVSigner.PublicKeyNotRegistered.selector);
+        emvSigner.validateUserOp(op, bytes32(0));
+    }
+
+    function test_EMVSignerPermissionModeRejectsUnauthorizedSignatureKeyEnvelope() public whenInitialized {
+        emvSigner.onInstall(abi.encodePacked(_emvPermissionKey(), abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y)));
+
+        KernelUserOp memory op;
+        op.sender = address(this);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignatureForKey(OTHER_PUBKEY_X, OTHER_PUBKEY_Y);
+
+        vm.expectRevert(EMVSigner.PublicKeyNotRegistered.selector);
+        emvSigner.checkUserOpSignature(_emvPermissionKey(), op, bytes32(0));
     }
 
     // ========== ACQUIRER CONFIG TESTS ==========
