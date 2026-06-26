@@ -1420,66 +1420,6 @@ contract EMVValidatorTest is KernelTestBase {
         emvValidator.setPerTxnMax(keyHash, 10_000);
     }
 
-    function test_EMVValidatorPerTransactionLimit() public whenInitialized {
-        _installEMVValidator();
-
-        bytes32 keyHash = _testKeyHash();
-        vm.prank(address(kernel));
-        emvValidator.setPerTxnMax(keyHash, 9_999);
-
-        KernelUserOp memory op;
-        op.sender = address(kernel);
-        op.callData = _encodeSimpleTransferCall();
-        op.signature = _createEMVSignature();
-
-        vm.prank(address(kernel));
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                EMVValidator.PerTransactionLimitExceeded.selector, keyHash, uint96(10_000), uint96(9_999)
-            )
-        );
-        emvValidator.validateUserOp(op, bytes32(0));
-    }
-
-    function test_EMVValidatorCycleLimit() public whenInitialized {
-        _installEMVValidator();
-
-        bytes32 keyHash = _testKeyHash();
-        vm.prank(address(kernel));
-        emvValidator.setCycleMax(keyHash, 9_999);
-
-        KernelUserOp memory op;
-        op.sender = address(kernel);
-        op.callData = _encodeSimpleTransferCall();
-        op.signature = _createEMVSignature();
-
-        vm.prank(address(kernel));
-        vm.expectRevert(
-            abi.encodeWithSelector(EMVValidator.CycleLimitExceeded.selector, keyHash, uint256(10_000), uint96(9_999))
-        );
-        emvValidator.validateUserOp(op, bytes32(0));
-    }
-
-    function test_EMVValidatorCycleTotalUpdatesOnValidation() public whenInitialized {
-        _installEMVValidator();
-
-        bytes32 keyHash = _testKeyHash();
-        vm.prank(address(kernel));
-        emvValidator.setCycleMax(keyHash, 15_000);
-
-        KernelUserOp memory op;
-        op.sender = address(kernel);
-        op.callData = _encodeSimpleTransferCall();
-        op.signature = _createEMVSignature();
-
-        vm.prank(address(kernel));
-        uint256 validationData = emvValidator.validateUserOp(op, bytes32(0));
-        assertEq(validationData, SIG_VALIDATION_SUCCESS_UINT);
-
-        (,, uint96 cycleTotal,) = emvValidator.getCardLimits(address(kernel), keyHash);
-        assertEq(cycleTotal, 10_000);
-    }
-
     function test_EMVValidatorAtcGapAccepted() public whenInitialized {
         // Strictly-increasing ATC: a card-signed ATC ABOVE the expected (a gap left by an
         // off-chain-declined tap that incremented the card without reaching the validator) PASSES the

@@ -49,7 +49,6 @@ contract EMVValidator is IValidator {
     // ========== STORAGE ==========
 
     uint256 private constant ATC_MAX = type(uint16).max;
-    uint256 private constant CYCLE_DURATION = 1 days;
     // The signed message is exactly what the JavaCard applet signs at GPO:
     // ATC(2) || PDOL(50) = 52 bytes (see emv-card-sim PaymentApplication.java
     // generateEcdsaAtGpo + profiles/default.yaml canonical PDOL). The contract
@@ -109,13 +108,10 @@ contract EMVValidator is IValidator {
     error PublicKeyNotRegistered();
     error InvalidPublicKeySize();
     error InvalidPublicKey();
-    error PerTransactionLimitExceeded(bytes32 keyHash, uint96 amount, uint96 perTxnMax);
-    error CycleLimitExceeded(bytes32 keyHash, uint256 attemptedTotal, uint96 cycleMax);
     error ATCExhausted(bytes32 keyHash);
     error InvalidSender();
     error InvalidSignature();
     error CardFrozen(bytes32 keyHash);
-    error InvalidAmount();
 
     event EMVValidatorInstalled(address indexed account, uint16 atc, bytes32 pubkeyX, bytes32 pubkeyY);
     event EMVCardFrozen(address indexed account, bytes32 indexed keyHash);
@@ -243,14 +239,13 @@ contract EMVValidator is IValidator {
             revert InvalidPublicKey();
         }
 
-        (bytes4 unpredictableNumber, uint256 currentATC, uint96 amount) =
-            _validateCardData(emvFields, msg.sender, keyHash);
+        (bytes4 unpredictableNumber, uint256 currentATC) = _validateCardData(emvFields, msg.sender, keyHash);
 
         if (!_verifyEMVSignature(emvFields, pubkeyX, pubkeyY, r, s)) {
             return SIG_VALIDATION_FAILED_UINT;
         }
 
-        _updateCardData(keyHash, unpredictableNumber, currentATC, amount);
+        _updateCardData(keyHash, unpredictableNumber, currentATC);
 
         return SIG_VALIDATION_SUCCESS_UINT;
     }
@@ -574,35 +569,13 @@ contract EMVValidator is IValidator {
     }
 
     /**
-     * @dev Extract the ISO 8583 amount in two-decimal minor units from packed EMV fields.
-     * @param emvFields The 52-byte EMV fields calldata
-     */
-    function _extractAmountCents(bytes calldata emvFields) internal pure returns (uint96 amount) {
-        (,, uint256 amountOffset,) = _emvFieldOffsets(emvFields);
-
-        for (uint256 i = 0; i < 6;) {
-            uint8 byteValue = uint8(emvFields[amountOffset + i]);
-            uint8 highNibble = byteValue >> 4;
-            uint8 lowNibble = byteValue & 0x0F;
-            if (highNibble > 9 || lowNibble > 9) {
-                revert InvalidAmount();
-            }
-
-            amount = amount * 100 + highNibble * 10 + lowNibble;
-            unchecked {
-                ++i;
-            }
-        }
-    }
-
-    /**
-     * @dev Validate replay protection, ATC, and spending limits without mutating storage
+     * @dev Validate replay protection and ATC without mutating storage
      * @param emvFields The EMV fields calldata to extract data from
      */
     function _validateCardData(bytes calldata emvFields, address account, bytes32 keyHash)
         internal
         view
-        returns (bytes4 unpredictableNumberBytes, uint256 currentATC, uint96 amount)
+        returns (bytes4 unpredictableNumberBytes, uint256 currentATC)
     {
         // Extract values using assembly for efficiency
         (uint256 unpredictableNumberOffset, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
@@ -639,26 +612,10 @@ contract EMVValidator is IValidator {
             revert InvalidATCSequence(uint16(currentATC), receivedATC);
         }
 
-        amount = _extractAmountCents(emvFields);
-        if (amount > card.perTxnMax) {
-            revert PerTransactionLimitExceeded(keyHash, amount, card.perTxnMax);
-        }
-
-        uint96 cycleTotal = card.cycleTotal;
-        if (_currentCycleTimestamp() >= card.cycle + CYCLE_DURATION) {
-            cycleTotal = 0;
-        }
-        uint256 attemptedTotal = uint256(cycleTotal) + amount;
-        if (attemptedTotal > card.cycleMax) {
-            revert CycleLimitExceeded(keyHash, attemptedTotal, card.cycleMax);
-        }
-
         currentATC = receivedATC;
     }
 
-    function _updateCardData(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC, uint96 amount)
-        internal
-    {
+    function _updateCardData(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC) internal {
         if (currentATC == ATC_MAX) {
             revert ATCExhausted(keyHash);
         }
@@ -669,14 +626,6 @@ contract EMVValidator is IValidator {
 
         card.usedUnpredictableNumbers[unpredictableNumber] = true;
         card.atc = uint152(nextATC);
-
-        uint64 currentCycle = _currentCycleTimestamp();
-        if (currentCycle >= card.cycle + CYCLE_DURATION) {
-            card.cycle = currentCycle;
-            card.cycleTotal = amount;
-        } else {
-            card.cycleTotal += amount;
-        }
 
         emit ReplayProtectionUpdated(msg.sender, keyHash, unpredictableNumberBytes, nextATC);
     }
