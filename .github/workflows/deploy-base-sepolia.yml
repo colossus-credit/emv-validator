@@ -90,14 +90,18 @@ jobs:
           token_address="$(extract_address ColossusTestToken)"
           acquirer_config_address="$(extract_address AcquirerConfig)"
           emv_settlement_address="$(extract_address EMVSettlement)"
-          emv_validator_address="$(extract_address EMVValidator)"
+          emv_signer_address="$(extract_address EMVSigner)"
+          emv_card_policy_address="$(extract_address EMVCardPolicy)"
+          emv_limit_policy_address="$(extract_address EMVLimitPolicy)"
 
           {
             echo "DEPLOYER_ADDRESS=$deployer_address"
             echo "TOKEN_ADDRESS=$token_address"
             echo "ACQUIRER_CONFIG_ADDRESS=$acquirer_config_address"
             echo "EMV_SETTLEMENT_ADDRESS=$emv_settlement_address"
-            echo "EMV_VALIDATOR_ADDRESS=$emv_validator_address"
+            echo "EMV_SIGNER_ADDRESS=$emv_signer_address"
+            echo "EMV_CARD_POLICY_ADDRESS=$emv_card_policy_address"
+            echo "EMV_LIMIT_POLICY_ADDRESS=$emv_limit_policy_address"
           } >> "$GITHUB_ENV"
 
       - name: Smoke test deployed contracts
@@ -112,7 +116,9 @@ jobs:
           : "${TOKEN_ADDRESS:?Missing TOKEN_ADDRESS from deployment broadcast}"
           : "${ACQUIRER_CONFIG_ADDRESS:?Missing ACQUIRER_CONFIG_ADDRESS from deployment broadcast}"
           : "${EMV_SETTLEMENT_ADDRESS:?Missing EMV_SETTLEMENT_ADDRESS from deployment broadcast}"
-          : "${EMV_VALIDATOR_ADDRESS:?Missing EMV_VALIDATOR_ADDRESS from deployment broadcast}"
+          : "${EMV_SIGNER_ADDRESS:?Missing EMV_SIGNER_ADDRESS from deployment broadcast}"
+          : "${EMV_CARD_POLICY_ADDRESS:?Missing EMV_CARD_POLICY_ADDRESS from deployment broadcast}"
+          : "${EMV_LIMIT_POLICY_ADDRESS:?Missing EMV_LIMIT_POLICY_ADDRESS from deployment broadcast}"
 
           export TOKEN_DECIMALS="${TOKEN_DECIMALS:-6}"
           export INITIAL_TOKEN_SUPPLY="${INITIAL_TOKEN_SUPPLY:-0}"

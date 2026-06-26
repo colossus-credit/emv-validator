@@ -1,15 +1,15 @@
-# Kernel EMV Validator
+# Kernel EMV Signer
 
-An **ERC-7579 compliant validator module** for smart contract wallets that enables on-chain validation of EMV (Europay, Mastercard, Visa) payment card transactions using cryptographic Combined Data Authentication (CDA).
+An **ERC-7579 compliant signer/policy module set** for smart contract wallets that enables on-chain validation of EMV (Europay, Mastercard, Visa) payment card transactions using P-256 signatures.
 
 ## Overview
 
-This project enables smart contract wallets to accept payment card transactions by validating EMV CDA signatures on-chain and automatically settling funds to merchants with a configurable multi-party fee structure. It integrates with the [Kernel](https://github.com/zerodev-xyz/kernel) ERC-4337 smart contract wallet framework.
+This project enables smart contract wallets to accept payment card transactions by validating EMV P-256 signatures on-chain and automatically settling funds to merchants with a configurable multi-party fee structure. It integrates with the [Kernel](https://github.com/zerodev-xyz/kernel) ERC-4337 smart contract wallet framework.
 
 ### Key Features
 
-- **🔐 EMV CDA Validation**: On-chain verification of RSA-2048 signed payment card transactions
-- **🎯 ERC-7579 Compliant**: Fully compatible validator module for modular smart accounts
+- **🔐 EMV Signature Validation**: On-chain verification of P-256 signed payment card transactions
+- **🎯 ERC-7579 Compliant**: Signer and policy modules for modular smart accounts
 - **💰 Multi-Fee Settlement**: Configurable fee distribution (acquirer, swipe, interchange, network)
 - **🛡️ Replay Protection**: Dual protection via unpredictable numbers and application transaction counters (ATC)
 - **⚡ Gas Optimized**: Assembly-optimized calldata extraction and storage operations
@@ -19,21 +19,30 @@ This project enables smart contract wallets to accept payment card transactions 
 
 ### Core Contracts
 
-1. **`EMVValidator.sol`**
-   - ERC-7579 validator module
-   - Validates EMV CDA signatures using RSA-2048 with SHA-256
-   - Implements replay protection (unpredictable numbers + ATC)
-   - Enforces target address and function selector validation
-   - Supports USD (840) and USN (997) currency codes
+1. **`EMVSigner.sol`**
+   - ERC-7579 signer module
+   - Validates EMV P-256 signatures over the card-signed payload
+   - Binds signatures to the configured card public key
 
-2. **`EMVSettlement.sol`**
+2. **`EMVCardPolicy.sol`**
+   - ERC-7579 policy module
+   - Registers card public keys per account/permission
+   - Enforces replay protection with unpredictable numbers and ATC
+   - Supports card freeze, unfreeze, and revoke controls
+
+3. **`EMVLimitPolicy.sol`**
+   - ERC-7579 policy module
+   - Enforces supported transaction type, currency, and amount fields
+   - Tracks per-transaction and 24-hour cycle limits
+
+4. **`EMVSettlement.sol`**
    - ERC-7579 executor module
    - Processes EMV transaction data and distributes funds
    - Extracts BCD-encoded amounts and merchant identifiers
    - Executes ERC20 token transfers to all fee recipients
    - Calculates merchant remainder after fee deductions
 
-3. **`AcquirerConfig.sol`**
+5. **`AcquirerConfig.sol`**
    - Merchant-selected acquirer registry
    - Configurable four-tier fee structure:
      - Acquirer fee (0-0.30%)
@@ -50,17 +59,17 @@ This project enables smart contract wallets to accept payment card transactions 
 ```
 1. Payment Card → EMV Terminal
    └─ Generates ARQC (Authorization Request Cryptogram)
-   └─ Signs transaction data with card's RSA private key
+   └─ Signs transaction data with card's P-256 private key
 
 2. Terminal → Smart Contract Wallet (via ERC-4337 UserOp)
    └─ Packs EMV data into signature field
    └─ Calls Kernel.execute() targeting EMVSettlement
 
-3. EMVValidator validates signature
-   ├─ Verifies RSA-2048 signature (PKCS#1 v1.5 + SHA-256)
-   ├─ Checks replay protection (unpredictableNumber + ATC)
-   ├─ Validates currency code (USD/USN only)
-   └─ Verifies target address and function selector
+3. Permission validation runs policies and signer
+   ├─ ZeroDev CallPolicy verifies target address and function selector
+   ├─ EMVCardPolicy checks replay protection (unpredictableNumber + ATC)
+   ├─ EMVLimitPolicy validates transaction limits and accepted EMV fields
+   └─ EMVSigner verifies the P-256 signature
 
 4. If valid → EMVSettlement executes
    ├─ Extracts transaction amount (BCD format)
@@ -97,7 +106,6 @@ forge install
 - [Foundry](https://book.getfoundry.sh/)
 - [Kernel](https://github.com/zerodev-xyz/kernel) (ERC-7579 smart account framework)
 - [Solady](https://github.com/Vectorized/solady) (Optimized utilities)
-- [SolRsaVerify](https://github.com/adria0/SolRsaVerify) (RSA signature verification)
 
 ## Usage
 
@@ -139,9 +147,18 @@ forge create src/EMVSettlement.sol:EMVSettlement \
   --rpc-url $RPC_URL \
   --private-key $PRIVATE_KEY
 
-# 3. Deploy EMVValidator
-forge create src/EMVValidator.sol:EMVValidator \
-  --constructor-args <TARGET> <SELECTOR> \
+# 3. Deploy EMVSigner
+forge create src/EMVSigner.sol:EMVSigner \
+  --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY
+
+# 4. Deploy EMVCardPolicy
+forge create src/policy/EMVCardPolicy.sol:EMVCardPolicy \
+  --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY
+
+# 5. Deploy EMVLimitPolicy
+forge create src/policy/EMVLimitPolicy.sol:EMVLimitPolicy \
   --rpc-url $RPC_URL \
   --private-key $PRIVATE_KEY
 ```
@@ -185,9 +202,9 @@ The contracts employ several gas optimization techniques:
 - Only USD (840) and USN (997) currency codes accepted
 - Prevents incorrect amount interpretations
 
-### RSA Key Size
+### Signature Scheme
 
-- **RSA-2048 only**: RSA-1024 explicitly rejected for security
+- **P-256 only**: EMVSigner verifies the card-signed SHA-256 payload with secp256r1.
 - Uses PKCS#1 v1.5 padding with SHA-256
 
 ### Target Validation

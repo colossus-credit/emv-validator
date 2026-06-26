@@ -5,8 +5,15 @@ import {Script, console2} from "forge-std/Script.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {ColossusTestToken} from "../test/util/ColossusTestToken.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
-import {EMVValidator} from "../src/EMVValidator.sol";
-import {MODULE_TYPE_EXECUTOR, MODULE_TYPE_VALIDATOR} from "kernel/src/types/Constants.sol";
+import {EMVSigner} from "../src/EMVSigner.sol";
+import {EMVCardPolicy} from "../src/policy/EMVCardPolicy.sol";
+import {EMVLimitPolicy} from "../src/policy/EMVLimitPolicy.sol";
+import {
+    MODULE_TYPE_EXECUTOR,
+    MODULE_TYPE_POLICY,
+    MODULE_TYPE_SIGNER,
+    MODULE_TYPE_VALIDATOR
+} from "kernel/src/types/Constants.sol";
 
 contract SmokeBaseSepolia is Script {
     uint256 private constant BASE_SEPOLIA_CHAIN_ID = 84532;
@@ -25,17 +32,23 @@ contract SmokeBaseSepolia is Script {
         address tokenAddress = vm.envAddress("TOKEN_ADDRESS");
         address acquirerConfigAddress = vm.envAddress("ACQUIRER_CONFIG_ADDRESS");
         address settlementAddress = vm.envAddress("EMV_SETTLEMENT_ADDRESS");
-        address validatorAddress = vm.envAddress("EMV_VALIDATOR_ADDRESS");
+        address signerAddress = vm.envAddress("EMV_SIGNER_ADDRESS");
+        address cardPolicyAddress = vm.envAddress("EMV_CARD_POLICY_ADDRESS");
+        address limitPolicyAddress = vm.envAddress("EMV_LIMIT_POLICY_ADDRESS");
 
         _assertHasCode(tokenAddress, "token code");
         _assertHasCode(acquirerConfigAddress, "acquirer config code");
         _assertHasCode(settlementAddress, "settlement code");
-        _assertHasCode(validatorAddress, "validator code");
+        _assertHasCode(signerAddress, "signer code");
+        _assertHasCode(cardPolicyAddress, "card policy code");
+        _assertHasCode(limitPolicyAddress, "limit policy code");
 
         ColossusTestToken token = ColossusTestToken(tokenAddress);
         AcquirerConfig acquirerConfig = AcquirerConfig(acquirerConfigAddress);
         EMVSettlement settlement = EMVSettlement(settlementAddress);
-        EMVValidator validator = EMVValidator(validatorAddress);
+        EMVSigner signer = EMVSigner(signerAddress);
+        EMVCardPolicy cardPolicy = EMVCardPolicy(cardPolicyAddress);
+        EMVLimitPolicy limitPolicy = EMVLimitPolicy(limitPolicyAddress);
 
         _assertEqString(token.name(), "Colossus Test Token", "token name");
         _assertEqString(token.symbol(), "COLT", "token symbol");
@@ -53,13 +66,21 @@ contract SmokeBaseSepolia is Script {
         _assertTrue(settlement.isModuleType(MODULE_TYPE_EXECUTOR), "settlement executor module type");
         _assertTrue(settlement.isInitialized(address(0)), "settlement initialized");
 
-        _assertTrue(validator.isModuleType(MODULE_TYPE_VALIDATOR), "validator module type");
+        _assertTrue(signer.isModuleType(MODULE_TYPE_VALIDATOR), "signer validator module type");
+        _assertTrue(signer.isModuleType(MODULE_TYPE_SIGNER), "signer module type");
+        _assertTrue(signer.isInitialized(address(0)), "signer initialized");
+        _assertTrue(cardPolicy.isModuleType(MODULE_TYPE_POLICY), "card policy module type");
+        _assertTrue(cardPolicy.isInitialized(address(0)), "card policy initialized");
+        _assertTrue(limitPolicy.isModuleType(MODULE_TYPE_POLICY), "limit policy module type");
+        _assertTrue(limitPolicy.isInitialized(address(0)), "limit policy initialized");
 
         console2.log("Base Sepolia smoke test passed");
         console2.log("ColossusTestToken:", tokenAddress);
         console2.log("AcquirerConfig:", acquirerConfigAddress);
         console2.log("EMVSettlement:", settlementAddress);
-        console2.log("EMVValidator:", validatorAddress);
+        console2.log("EMVSigner:", signerAddress);
+        console2.log("EMVCardPolicy:", cardPolicyAddress);
+        console2.log("EMVLimitPolicy:", limitPolicyAddress);
     }
 
     function _assertHasCode(address account, string memory check) private view {
