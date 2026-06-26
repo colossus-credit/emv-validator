@@ -283,10 +283,11 @@ contract EMVValidator is IValidator {
             return ERC1271_INVALID;
         }
 
-        CardData storage card = cards[sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
+
+        CardData storage card = cards[sender][keyHash];
         if (card.frozen) {
             revert CardFrozen(keyHash);
         }
@@ -311,28 +312,27 @@ contract EMVValidator is IValidator {
     }
 
     function freezeCard(bytes32 keyHash) external {
-        CardData storage card = cards[msg.sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(msg.sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
 
+        CardData storage card = cards[msg.sender][keyHash];
         card.frozen = true;
         emit EMVCardFrozen(msg.sender, keyHash);
     }
 
     function unfreezeCard(bytes32 keyHash) external {
-        CardData storage card = cards[msg.sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(msg.sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
 
+        CardData storage card = cards[msg.sender][keyHash];
         card.frozen = false;
         emit EMVCardUnfrozen(msg.sender, keyHash);
     }
 
     function revokeCard(bytes32 keyHash) external {
-        CardData storage card = cards[msg.sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(msg.sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
 
@@ -341,21 +341,21 @@ contract EMVValidator is IValidator {
     }
 
     function setCycleMax(bytes32 keyHash, uint96 cycleMax) external {
-        CardData storage card = cards[msg.sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(msg.sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
 
+        CardData storage card = cards[msg.sender][keyHash];
         card.cycleMax = cycleMax;
         emit EMVCardCycleMaxUpdated(msg.sender, keyHash, cycleMax);
     }
 
     function setPerTxnMax(bytes32 keyHash, uint96 perTxnMax) external {
-        CardData storage card = cards[msg.sender][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(msg.sender, keyHash)) {
             revert PublicKeyNotRegistered();
         }
 
+        CardData storage card = cards[msg.sender][keyHash];
         card.perTxnMax = perTxnMax;
         emit EMVCardPerTxnMaxUpdated(msg.sender, keyHash, perTxnMax);
     }
@@ -372,16 +372,17 @@ contract EMVValidator is IValidator {
         view
         returns (uint256 expectedATC, bool initialized)
     {
+        initialized = _isCardRegistered(account, keyHash);
         CardData storage card = cards[account][keyHash];
-        initialized = _isCardRegistered(card);
         expectedATC = card.atc;
     }
 
     function getExpectedATC(address account, bytes32 keyHash) external view returns (uint256 expectedATC) {
-        CardData storage card = cards[account][keyHash];
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(account, keyHash)) {
             revert PublicKeyNotRegistered();
         }
+
+        CardData storage card = cards[account][keyHash];
         return card.atc;
     }
 
@@ -399,7 +400,7 @@ contract EMVValidator is IValidator {
         returns (uint256 expectedATC, bool initialized, bool frozen)
     {
         CardData storage card = cards[account][keyHash];
-        return (card.atc, _isCardRegistered(card), card.frozen);
+        return (card.atc, _isCardRegistered(account, keyHash), card.frozen);
     }
 
     function getCardLimits(address account, bytes32 keyHash)
@@ -594,11 +595,11 @@ contract EMVValidator is IValidator {
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
         uint16 receivedATC = uint16(atcBytes);
 
-        CardData storage card = cards[account][keyHash];
-
-        if (!_isCardRegistered(card)) {
+        if (!_isCardRegistered(account, keyHash)) {
             revert PublicKeyNotRegistered();
         }
+
+        CardData storage card = cards[account][keyHash];
         if (card.frozen) {
             revert CardFrozen(keyHash);
         }
@@ -708,8 +709,8 @@ contract EMVValidator is IValidator {
         return computeKeyHash(pubkeyX, pubkeyY) == keyHash;
     }
 
-    function _isCardRegistered(CardData storage card) internal view returns (bool) {
-        return card.cycle != 0;
+    function _isCardRegistered(address account, bytes32 keyHash) internal view returns (bool) {
+        return cards[account][keyHash].cycle != 0;
     }
 
     function _currentCycleTimestamp() internal view returns (uint64) {
@@ -721,6 +722,6 @@ contract EMVValidator is IValidator {
     }
 
     function _isPublicKeyRegistered(address account, bytes32 keyHash) internal view returns (bool) {
-        return _isCardRegistered(cards[account][keyHash]);
+        return _isCardRegistered(account, keyHash);
     }
 }
