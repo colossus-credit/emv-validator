@@ -30,14 +30,6 @@ contract EMVValidatorTest is KernelTestBase {
     event EMVCardFrozen(address indexed account, bytes32 indexed keyHash);
     event EMVCardUnfrozen(address indexed account, bytes32 indexed keyHash);
     event EMVCardRevoked(address indexed account, bytes32 indexed keyHash);
-    event EMVTransferExecuted(
-        address indexed from,
-        address indexed to,
-        address indexed token,
-        uint256 amount,
-        bytes4 unpredictableNumber,
-        uint16 atc
-    );
 
     // Test P-256 keypair (ECDSA secp256r1)
     // Private key (reference only): 0x519b423d715f8b581f4fa8ee59f4771a5b44c8130b4e3eacca54a56dda72b464
@@ -127,8 +119,7 @@ contract EMVValidatorTest is KernelTestBase {
         emvSettlement = new EMVSettlement(
             address(mockERC20), // token address
             address(acquirerConfig), // acquirer config address
-            18, // token decimals
-            address(this) // owner
+            18 // token decimals
         );
 
         // Deploy EMV validator with target and selector
@@ -1171,15 +1162,15 @@ contract EMVValidatorTest is KernelTestBase {
     function test_EMVSettlementErrors() public {
         // Test constructor with invalid token address
         vm.expectRevert(EMVSettlement.InvalidConfig.selector);
-        new EMVSettlement(address(0), address(acquirerConfig), 18, address(this));
+        new EMVSettlement(address(0), address(acquirerConfig), 18);
 
         // Test constructor with invalid acquirer config
         vm.expectRevert(EMVSettlement.InvalidConfig.selector);
-        new EMVSettlement(address(mockERC20), address(0), 18, address(this));
+        new EMVSettlement(address(mockERC20), address(0), 18);
 
         // Test constructor with invalid decimals
         vm.expectRevert(EMVSettlement.InvalidDecimals.selector);
-        new EMVSettlement(address(mockERC20), address(acquirerConfig), 1, address(this));
+        new EMVSettlement(address(mockERC20), address(acquirerConfig), 1);
     }
 
     function test_EMVSettlementUninstall() public {

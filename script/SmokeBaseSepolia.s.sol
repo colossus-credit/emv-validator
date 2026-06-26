@@ -51,7 +51,6 @@ contract SmokeBaseSepolia is Script {
         _assertEqAddress(settlementToken, tokenAddress, "settlement token");
         _assertEqAddress(settlementConfig, acquirerConfigAddress, "settlement acquirer config");
         _assertEqUint8(settlementDecimals, expectedTokenDecimals, "settlement decimals");
-        _assertEqAddress(settlement.owner(), deployer, "settlement owner");
         _assertTrue(settlement.isModuleType(MODULE_TYPE_EXECUTOR), "settlement executor module type");
         _assertTrue(settlement.isInitialized(address(0)), "settlement initialized");
 

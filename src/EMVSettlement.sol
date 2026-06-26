@@ -5,23 +5,16 @@ pragma solidity ^0.8.23;
 import {AcquirerConfig} from "./AcquirerConfig.sol";
 import {MODULE_TYPE_EXECUTOR} from "kernel/src/types/Constants.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
-import {Ownable} from "solady/auth/Ownable.sol";
 
 /**
  * @title EMVSettlement
  * @dev Handles EMV transaction settlement and ERC20 token transfers
  * @notice Processes EMV transaction data and executes corresponding token transfers
  */
-contract EMVSettlement is Ownable {
+contract EMVSettlement {
     // ========== EVENTS ==========
 
-    event EMVTransferExecuted(address indexed from, address indexed to, address indexed token, uint256 amount);
-
-    event EMVMultiTransferExecuted(
-        address indexed from, address indexed token, uint256 totalAmount, uint256 recipientCount
-    );
     event EMVSettlementConfigured(address indexed account, address token, address recipient);
-    event NetworkFeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
 
     // ========== STORAGE ==========
 
@@ -32,7 +25,7 @@ contract EMVSettlement is Ownable {
 
     // ========== CONSTRUCTOR ==========
 
-    constructor(address _tokenAddress, address _acquirerConfigAddress, uint8 _decimals, address _owner) {
+    constructor(address _tokenAddress, address _acquirerConfigAddress, uint8 _decimals) {
         if (_tokenAddress == address(0) || _acquirerConfigAddress == address(0)) {
             revert InvalidConfig();
         }
@@ -44,9 +37,6 @@ contract EMVSettlement is Ownable {
         configuredToken = _tokenAddress;
         acquirerConfig = AcquirerConfig(_acquirerConfigAddress);
         decimals = _decimals;
-
-        // Initialize Ownable
-        _initializeOwner(_owner);
     }
 
     // ========== ERRORS ==========

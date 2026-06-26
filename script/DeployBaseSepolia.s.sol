@@ -39,7 +39,7 @@ contract DeployBaseSepolia is Script {
             token.mint(deployer, initialTokenSupply);
         }
         acquirerConfig = new AcquirerConfig();
-        emvSettlement = new EMVSettlement(address(token), address(acquirerConfig), uint8(tokenDecimals), deployer);
+        emvSettlement = new EMVSettlement(address(token), address(acquirerConfig), uint8(tokenDecimals));
         emvValidator = new EMVValidator(address(emvSettlement), validatorSelector());
 
         (address validationTarget, bytes4 validationSelector) = emvValidator.getValidationConfig();
