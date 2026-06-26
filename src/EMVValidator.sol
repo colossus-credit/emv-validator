@@ -89,11 +89,10 @@ contract EMVValidator is IValidator {
         uint96 perTxnMax;
         uint152 atc;
         bool frozen;
+        mapping(uint32 unpredictableNumber => bool used) usedUnpredictableNumbers;
     }
 
     mapping(address account => mapping(bytes32 keyHash => CardData card)) private cards;
-    mapping(address account => mapping(bytes32 keyHash => mapping(uint32 unpredictableNumber => bool used))) private
-        usedUnpredictableNumbers;
     address public immutable target; // Expected target address for validation
     bytes4 public immutable selector; // Expected function selector for validation
 
@@ -178,14 +177,12 @@ contract EMVValidator is IValidator {
 
         bytes32 keyHash = computeKeyHash(pubkeyX, pubkeyY);
 
-        cards[msg.sender][keyHash] = CardData({
-            cycle: _currentCycleTimestamp(),
-            cycleMax: cycleMax,
-            cycleTotal: 0,
-            perTxnMax: perTxnMax,
-            atc: uint152(atc),
-            frozen: false
-        });
+        cards[msg.sender][keyHash].cycle = _currentCycleTimestamp();
+        cards[msg.sender][keyHash].cycleMax = cycleMax;
+        cards[msg.sender][keyHash].cycleTotal = 0;
+        cards[msg.sender][keyHash].perTxnMax = perTxnMax;
+        cards[msg.sender][keyHash].atc = uint152(atc);
+        cards[msg.sender][keyHash].frozen = false;
 
         emit EMVValidatorInstalled(msg.sender, atc, pubkeyX, pubkeyY);
     }
@@ -423,7 +420,7 @@ contract EMVValidator is IValidator {
         view
         returns (bool used)
     {
-        return usedUnpredictableNumbers[account][keyHash][uint32(unpredictableNumber)];
+        return cards[account][keyHash].usedUnpredictableNumbers[uint32(unpredictableNumber)];
     }
 
     // ========== INTERNAL VALIDATION FUNCTIONS ==========
@@ -611,7 +608,7 @@ contract EMVValidator is IValidator {
         }
 
         // Validate replay protection
-        if (usedUnpredictableNumbers[account][keyHash][unpredictableNumber]) {
+        if (cards[account][keyHash].usedUnpredictableNumbers[unpredictableNumber]) {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
@@ -651,7 +648,7 @@ contract EMVValidator is IValidator {
 
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
         uint256 nextATC = currentATC + 1;
-        usedUnpredictableNumbers[msg.sender][keyHash][unpredictableNumber] = true;
+        cards[msg.sender][keyHash].usedUnpredictableNumbers[unpredictableNumber] = true;
         cards[msg.sender][keyHash].atc = uint152(nextATC);
 
         uint64 currentCycle = _currentCycleTimestamp();
