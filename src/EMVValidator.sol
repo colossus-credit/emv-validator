@@ -283,12 +283,12 @@ contract EMVValidator is IValidator {
             return ERC1271_INVALID;
         }
 
-        if (!_isCardRegistered(sender, keyHash)) {
+        (uint64 cycle,,,,, bool frozen) = _loadCardData(sender, keyHash);
+        if (cycle == 0) {
             revert PublicKeyNotRegistered();
         }
 
-        CardData storage card = cards[sender][keyHash];
-        if (card.frozen) {
+        if (frozen) {
             revert CardFrozen(keyHash);
         }
 
@@ -372,18 +372,20 @@ contract EMVValidator is IValidator {
         view
         returns (uint256 expectedATC, bool initialized)
     {
-        initialized = _isCardRegistered(account, keyHash);
-        CardData storage card = cards[account][keyHash];
-        expectedATC = card.atc;
+        uint64 cycle;
+        uint152 atc;
+        (cycle,,,, atc,) = _loadCardData(account, keyHash);
+        initialized = cycle != 0;
+        expectedATC = atc;
     }
 
     function getExpectedATC(address account, bytes32 keyHash) external view returns (uint256 expectedATC) {
-        if (!_isCardRegistered(account, keyHash)) {
+        (uint64 cycle,,,, uint152 atc,) = _loadCardData(account, keyHash);
+        if (cycle == 0) {
             revert PublicKeyNotRegistered();
         }
 
-        CardData storage card = cards[account][keyHash];
-        return card.atc;
+        return atc;
     }
 
     function isPublicKeyRegistered(address account, bytes32 keyHash) external view returns (bool) {
@@ -399,8 +401,8 @@ contract EMVValidator is IValidator {
         view
         returns (uint256 expectedATC, bool initialized, bool frozen)
     {
-        CardData storage card = cards[account][keyHash];
-        return (card.atc, _isCardRegistered(account, keyHash), card.frozen);
+        (uint64 cycle,,,, uint152 atc, bool frozen_) = _loadCardData(account, keyHash);
+        return (atc, cycle != 0, frozen_);
     }
 
     function getCardLimits(address account, bytes32 keyHash)
@@ -408,8 +410,7 @@ contract EMVValidator is IValidator {
         view
         returns (uint64 cycle, uint96 cycleMax, uint96 cycleTotal, uint96 perTxnMax)
     {
-        CardData storage card = cards[account][keyHash];
-        return (card.cycle, card.cycleMax, card.cycleTotal, card.perTxnMax);
+        (cycle, cycleMax, cycleTotal, perTxnMax,,) = _loadCardData(account, keyHash);
     }
 
     /**
@@ -595,22 +596,23 @@ contract EMVValidator is IValidator {
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
         uint16 receivedATC = uint16(atcBytes);
 
-        if (!_isCardRegistered(account, keyHash)) {
+        (uint64 cycle, uint96 cycleMax, uint96 cycleTotal, uint96 perTxnMax, uint152 atc, bool frozen) =
+            _loadCardData(account, keyHash);
+        if (cycle == 0) {
             revert PublicKeyNotRegistered();
         }
 
-        CardData storage card = cards[account][keyHash];
-        if (card.frozen) {
+        if (frozen) {
             revert CardFrozen(keyHash);
         }
 
-        currentATC = card.atc;
+        currentATC = atc;
         if (currentATC > ATC_MAX) {
             revert ATCExhausted(keyHash);
         }
 
         // Validate replay protection
-        if (card.usedUnpredictableNumbers[unpredictableNumber]) {
+        if (cards[account][keyHash].usedUnpredictableNumbers[unpredictableNumber]) {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
@@ -623,17 +625,16 @@ contract EMVValidator is IValidator {
         if (amount == 0) {
             revert InvalidAmount();
         }
-        if (amount > card.perTxnMax) {
-            revert PerTransactionLimitExceeded(keyHash, amount, card.perTxnMax);
+        if (amount > perTxnMax) {
+            revert PerTransactionLimitExceeded(keyHash, amount, perTxnMax);
         }
 
-        uint96 cycleTotal = card.cycleTotal;
-        if (_currentCycleTimestamp() >= card.cycle + CYCLE_DURATION) {
+        if (_currentCycleTimestamp() >= cycle + CYCLE_DURATION) {
             cycleTotal = 0;
         }
         uint256 attemptedTotal = uint256(cycleTotal) + amount;
-        if (attemptedTotal > card.cycleMax) {
-            revert CycleLimitExceeded(keyHash, attemptedTotal, card.cycleMax);
+        if (attemptedTotal > cycleMax) {
+            revert CycleLimitExceeded(keyHash, attemptedTotal, cycleMax);
         }
 
         currentATC = receivedATC;
@@ -711,6 +712,39 @@ contract EMVValidator is IValidator {
 
     function _isCardRegistered(address account, bytes32 keyHash) internal view returns (bool) {
         return cards[account][keyHash].cycle != 0;
+    }
+
+    function _loadCardData(address account, bytes32 keyHash)
+        internal
+        view
+        returns (uint64 cycle, uint96 cycleMax, uint96 cycleTotal, uint96 perTxnMax, uint152 atc, bool frozen)
+    {
+        // Keep this in sync with CardData's fixed-field packing.
+        bytes32 cardSlot = _cardDataSlot(account, keyHash);
+        uint256 slot0;
+        uint256 slot1;
+        assembly {
+            slot0 := sload(cardSlot)
+            slot1 := sload(add(cardSlot, 1))
+        }
+
+        cycle = uint64(slot0);
+        cycleMax = uint96(slot0 >> 64);
+        cycleTotal = uint96(slot0 >> 160);
+        perTxnMax = uint96(slot1);
+        atc = uint152(slot1 >> 96);
+        frozen = ((slot1 >> 248) & 0xff) != 0;
+    }
+
+    function _cardDataSlot(address account, bytes32 keyHash) internal pure returns (bytes32 cardSlot) {
+        assembly {
+            mstore(0x00, account)
+            mstore(0x20, cards.slot)
+            let accountSlot := keccak256(0x00, 0x40)
+            mstore(0x00, keyHash)
+            mstore(0x20, accountSlot)
+            cardSlot := keccak256(0x00, 0x40)
+        }
     }
 
     function _currentCycleTimestamp() internal view returns (uint64) {
