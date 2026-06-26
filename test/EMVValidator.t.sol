@@ -1219,8 +1219,8 @@ contract EMVValidatorTest is KernelTestBase {
         vm.prank(address(kernel));
         emvValidator.onUninstall("");
 
-        // onUninstall only clears the account-level isInitialized state.
-        assertFalse(emvValidator.isInitialized(address(kernel)));
+        // onUninstall leaves card and replay state intact; isInitialized is an unconditional interface response.
+        assertTrue(emvValidator.isInitialized(address(kernel)));
         assertTrue(emvValidator.isPublicKeyRegistered(address(kernel), keyHash));
     }
 
@@ -1228,13 +1228,13 @@ contract EMVValidatorTest is KernelTestBase {
         // Create a new validator
         EMVValidator testValidator = new EMVValidator(address(emvSettlement), kernel.execute.selector);
 
-        // Should not be initialized for any account initially
-        assertFalse(testValidator.isInitialized(address(this)));
+        // EMVValidator does not track account-level initialization for this interface method.
+        assertTrue(testValidator.isInitialized(address(this)));
 
         // Install it with public key
         testValidator.onInstall(abi.encode(uint16(1), TEST_PUBKEY_X, TEST_PUBKEY_Y));
 
-        // Now should be initialized
+        // The interface response remains unconditional after installation.
         assertTrue(testValidator.isInitialized(address(this)));
     }
 
@@ -1396,6 +1396,88 @@ contract EMVValidatorTest is KernelTestBase {
         // Signature validation should fail, returning SIG_VALIDATION_FAILED_UINT
         vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+    }
+
+    function test_EMVValidatorSetSpendingLimits() public {
+        bytes32 keyHash = _testKeyHash();
+        emvValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        emvValidator.setCycleMax(keyHash, 25_000);
+        emvValidator.setPerTxnMax(keyHash, 10_000);
+
+        (, uint96 cycleMax,, uint96 perTxnMax) = emvValidator.getCardLimits(address(this), keyHash);
+        assertEq(cycleMax, 25_000);
+        assertEq(perTxnMax, 10_000);
+    }
+
+    function test_EMVValidatorSetSpendingLimitsRequiresRegisteredCard() public {
+        bytes32 keyHash = _testKeyHash();
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.setCycleMax(keyHash, 25_000);
+
+        vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
+        emvValidator.setPerTxnMax(keyHash, 10_000);
+    }
+
+    function test_EMVValidatorPerTransactionLimit() public whenInitialized {
+        _installEMVValidator();
+
+        bytes32 keyHash = _testKeyHash();
+        vm.prank(address(kernel));
+        emvValidator.setPerTxnMax(keyHash, 9_999);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                EMVValidator.PerTransactionLimitExceeded.selector, keyHash, uint96(10_000), uint96(9_999)
+            )
+        );
+        emvValidator.validateUserOp(op, bytes32(0));
+    }
+
+    function test_EMVValidatorCycleLimit() public whenInitialized {
+        _installEMVValidator();
+
+        bytes32 keyHash = _testKeyHash();
+        vm.prank(address(kernel));
+        emvValidator.setCycleMax(keyHash, 9_999);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        vm.expectRevert(
+            abi.encodeWithSelector(EMVValidator.CycleLimitExceeded.selector, keyHash, uint256(10_000), uint96(9_999))
+        );
+        emvValidator.validateUserOp(op, bytes32(0));
+    }
+
+    function test_EMVValidatorCycleTotalUpdatesOnValidation() public whenInitialized {
+        _installEMVValidator();
+
+        bytes32 keyHash = _testKeyHash();
+        vm.prank(address(kernel));
+        emvValidator.setCycleMax(keyHash, 15_000);
+
+        KernelUserOp memory op;
+        op.sender = address(kernel);
+        op.callData = _encodeSimpleTransferCall();
+        op.signature = _createEMVSignature();
+
+        vm.prank(address(kernel));
+        uint256 validationData = emvValidator.validateUserOp(op, bytes32(0));
+        assertEq(validationData, SIG_VALIDATION_SUCCESS_UINT);
+
+        (,, uint96 cycleTotal,) = emvValidator.getCardLimits(address(kernel), keyHash);
+        assertEq(cycleTotal, 10_000);
     }
 
     function test_EMVValidatorAtcGapAccepted() public whenInitialized {
@@ -1629,7 +1711,7 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
 
         assertEq(emvValidator.getExpectedATC(address(kernel), keyHash), 0);
-        assertFalse(emvValidator.isUnpredictableNumberUsed(address(kernel), bytes4(TEST_UNPREDICTABLE_NUMBER)));
+        assertFalse(emvValidator.isUnpredictableNumberUsed(address(kernel), keyHash, bytes4(TEST_UNPREDICTABLE_NUMBER)));
     }
 
     function test_UnfreezeCardRestoresUserOpsAndEmits() public whenInitialized {
@@ -1661,7 +1743,7 @@ contract EMVValidatorTest is KernelTestBase {
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
 
         assertEq(emvValidator.getExpectedATC(address(kernel), keyHash), 1);
-        assertTrue(emvValidator.isUnpredictableNumberUsed(address(kernel), bytes4(TEST_UNPREDICTABLE_NUMBER)));
+        assertTrue(emvValidator.isUnpredictableNumberUsed(address(kernel), keyHash, bytes4(TEST_UNPREDICTABLE_NUMBER)));
     }
 
     function test_FreezeCardBlocksERC1271() public {
@@ -1761,7 +1843,7 @@ contract EMVValidatorTest is KernelTestBase {
 
         // Try to validate signature for an account that never installed the validator
         vm.expectRevert(EMVValidator.PublicKeyNotRegistered.selector);
-        emvValidator.isValidSignatureWithSender(uninitializedAccount, testHash, TEST_SIGNATURE);
+        emvValidator.isValidSignatureWithSender(uninitializedAccount, testHash, _createEMVSignature());
     }
 
     function test_InvalidSignatureLength_WrongSignatureLength() public {

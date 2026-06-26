@@ -49,6 +49,7 @@ contract EMVValidator is IValidator {
     // ========== STORAGE ==========
 
     uint256 private constant ATC_MAX = type(uint16).max;
+    uint256 private constant CYCLE_DURATION = 1 days;
     // The signed message is exactly what the JavaCard applet signs at GPO:
     // ATC(2) || PDOL(50) = 52 bytes (see emv-card-sim PaymentApplication.java
     // generateEcdsaAtGpo + profiles/default.yaml canonical PDOL). The contract
@@ -80,19 +81,17 @@ contract EMVValidator is IValidator {
     uint8 private constant SUPPORTED_TXN_TYPE = 0x00; // Purchase / goods & services
     uint8 private constant SUPPORTED_CURRENCY_EXPONENT = 2; // minor units for USD (840) / USN (997)
 
-    struct CardState {
-        uint192 atc;
-        bool initialized;
+    struct CardData {
+        uint64 cycle;
+        uint96 cycleMax;
+        uint96 cycleTotal;
+        uint96 perTxnMax;
+        uint152 atc;
         bool frozen;
+        mapping(uint32 => bool) usedUnpredictableNumbers;
     }
 
-    struct EMVValidatorStorage {
-        bool initialized;
-        mapping(uint32 => bool) usedUnpredictableNumbers; // Track used unpredictable numbers (4 bytes)
-        mapping(bytes32 keyHash => CardState cardState) cards;
-    }
-
-    mapping(address => EMVValidatorStorage) public emvValidatorStorage;
+    mapping(address account => mapping(bytes32 keyHash => CardData card)) private cards;
     address public immutable target; // Expected target address for validation
     bytes4 public immutable selector; // Expected function selector for validation
 
@@ -110,15 +109,20 @@ contract EMVValidator is IValidator {
     error PublicKeyNotRegistered();
     error InvalidPublicKeySize();
     error InvalidPublicKey();
+    error PerTransactionLimitExceeded(bytes32 keyHash, uint96 amount, uint96 perTxnMax);
+    error CycleLimitExceeded(bytes32 keyHash, uint256 attemptedTotal, uint96 cycleMax);
     error ATCExhausted(bytes32 keyHash);
     error InvalidSender();
     error InvalidSignature();
     error CardFrozen(bytes32 keyHash);
+    error InvalidAmount();
 
     event EMVValidatorInstalled(address indexed account, uint16 atc, bytes32 pubkeyX, bytes32 pubkeyY);
     event EMVCardFrozen(address indexed account, bytes32 indexed keyHash);
     event EMVCardUnfrozen(address indexed account, bytes32 indexed keyHash);
     event EMVCardRevoked(address indexed account, bytes32 indexed keyHash);
+    event EMVCardCycleMaxUpdated(address indexed account, bytes32 indexed keyHash, uint96 cycleMax);
+    event EMVCardPerTxnMaxUpdated(address indexed account, bytes32 indexed keyHash, uint96 perTxnMax);
 
     // ========== CONSTRUCTOR ==========
 
@@ -140,16 +144,30 @@ contract EMVValidator is IValidator {
     /**
      * @dev Install the module with ATC configuration and P-256 public key registration
      * @param _data Encoded configuration: abi.encode(atc, pubkeyX, pubkeyY)
+     *        or abi.encode(atc, pubkeyX, pubkeyY, cycleMax, perTxnMax)
      *        - atc: uint16 - Initial ATC value
      *        - pubkeyX: bytes32 - P-256 public key x coordinate (32 bytes)
      *        - pubkeyY: bytes32 - P-256 public key y coordinate (32 bytes)
+     *        - cycleMax: uint96 - Optional 24-hour spend limit in 2-decimal ISO amount units
+     *        - perTxnMax: uint96 - Optional per-transaction spend limit in 2-decimal ISO amount units
      */
     function onInstall(bytes calldata _data) external payable override {
         if (_data.length == 0) {
             revert InvalidConfig();
         }
 
-        (uint16 atc, bytes32 pubkeyX, bytes32 pubkeyY) = abi.decode(_data, (uint16, bytes32, bytes32));
+        uint16 atc;
+        bytes32 pubkeyX;
+        bytes32 pubkeyY;
+        uint96 cycleMax;
+        uint96 perTxnMax;
+        if (_data.length == 96) {
+            (atc, pubkeyX, pubkeyY) = abi.decode(_data, (uint16, bytes32, bytes32));
+            cycleMax = type(uint96).max;
+            perTxnMax = type(uint96).max;
+        } else {
+            (atc, pubkeyX, pubkeyY, cycleMax, perTxnMax) = abi.decode(_data, (uint16, bytes32, bytes32, uint96, uint96));
+        }
 
         // Validate P-256 public key (not zero)
         if (pubkeyX == bytes32(0) || pubkeyY == bytes32(0)) {
@@ -158,9 +176,13 @@ contract EMVValidator is IValidator {
 
         bytes32 keyHash = computeKeyHash(pubkeyX, pubkeyY);
 
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
-        accountStorage.initialized = true;
-        accountStorage.cards[keyHash] = CardState({atc: uint192(atc), initialized: true, frozen: false});
+        CardData storage card = cards[msg.sender][keyHash];
+        card.cycle = _currentCycleTimestamp();
+        card.cycleMax = cycleMax;
+        card.cycleTotal = 0;
+        card.perTxnMax = perTxnMax;
+        card.atc = uint152(atc);
+        card.frozen = false;
 
         emit EMVValidatorInstalled(msg.sender, atc, pubkeyX, pubkeyY);
     }
@@ -169,8 +191,7 @@ contract EMVValidator is IValidator {
      * @dev Uninstall the module
      */
     function onUninstall(bytes calldata) external payable override {
-        emvValidatorStorage[msg.sender].initialized = false;
-        // Note: card state and used unpredictable numbers remain for security and cannot be enumerated.
+        // Card state and used unpredictable numbers remain for security and cannot be enumerated.
     }
 
     /**
@@ -181,14 +202,10 @@ contract EMVValidator is IValidator {
     }
 
     /**
-     * @dev Check if module is initialized for the smart account
+     * @dev Satisfy the ERC-7579 module interface without account-level storage.
      */
-    function isInitialized(address smartAccount) external view override returns (bool) {
-        return _isInitialized(smartAccount);
-    }
-
-    function _isInitialized(address smartAccount) internal view returns (bool) {
-        return emvValidatorStorage[smartAccount].initialized;
+    function isInitialized(address) external pure override returns (bool) {
+        return true;
     }
 
     // ========== VALIDATOR FUNCTIONS ==========
@@ -226,13 +243,14 @@ contract EMVValidator is IValidator {
             revert InvalidPublicKey();
         }
 
-        (bytes4 unpredictableNumber, uint256 currentATC) = _validateReplayProtection(emvFields, msg.sender, keyHash);
+        (bytes4 unpredictableNumber, uint256 currentATC, uint96 amount) =
+            _validateCardData(emvFields, msg.sender, keyHash);
 
         if (!_verifyEMVSignature(emvFields, pubkeyX, pubkeyY, r, s)) {
             return SIG_VALIDATION_FAILED_UINT;
         }
 
-        _updateReplayProtectionAndATC(keyHash, unpredictableNumber, currentATC);
+        _updateCardData(keyHash, unpredictableNumber, currentATC, amount);
 
         return SIG_VALIDATION_SUCCESS_UINT;
     }
@@ -254,10 +272,6 @@ contract EMVValidator is IValidator {
             revert InvalidSender();
         }
 
-        if (!_isInitialized(sender)) {
-            revert PublicKeyNotRegistered();
-        }
-
         if (sig.length != 160) {
             return ERC1271_INVALID;
         }
@@ -268,8 +282,8 @@ contract EMVValidator is IValidator {
             return ERC1271_INVALID;
         }
 
-        CardState memory card = emvValidatorStorage[sender].cards[keyHash];
-        if (!card.initialized) {
+        CardData storage card = cards[sender][keyHash];
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
         if (card.frozen) {
@@ -296,8 +310,8 @@ contract EMVValidator is IValidator {
     }
 
     function freezeCard(bytes32 keyHash) external {
-        CardState storage card = emvValidatorStorage[msg.sender].cards[keyHash];
-        if (!card.initialized) {
+        CardData storage card = cards[msg.sender][keyHash];
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
 
@@ -306,8 +320,8 @@ contract EMVValidator is IValidator {
     }
 
     function unfreezeCard(bytes32 keyHash) external {
-        CardState storage card = emvValidatorStorage[msg.sender].cards[keyHash];
-        if (!card.initialized) {
+        CardData storage card = cards[msg.sender][keyHash];
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
 
@@ -316,13 +330,33 @@ contract EMVValidator is IValidator {
     }
 
     function revokeCard(bytes32 keyHash) external {
-        CardState storage card = emvValidatorStorage[msg.sender].cards[keyHash];
-        if (!card.initialized) {
+        CardData storage card = cards[msg.sender][keyHash];
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
 
-        delete emvValidatorStorage[msg.sender].cards[keyHash];
+        delete cards[msg.sender][keyHash];
         emit EMVCardRevoked(msg.sender, keyHash);
+    }
+
+    function setCycleMax(bytes32 keyHash, uint96 cycleMax) external {
+        CardData storage card = cards[msg.sender][keyHash];
+        if (!_isCardRegistered(card)) {
+            revert PublicKeyNotRegistered();
+        }
+
+        card.cycleMax = cycleMax;
+        emit EMVCardCycleMaxUpdated(msg.sender, keyHash, cycleMax);
+    }
+
+    function setPerTxnMax(bytes32 keyHash, uint96 perTxnMax) external {
+        CardData storage card = cards[msg.sender][keyHash];
+        if (!_isCardRegistered(card)) {
+            revert PublicKeyNotRegistered();
+        }
+
+        card.perTxnMax = perTxnMax;
+        emit EMVCardPerTxnMaxUpdated(msg.sender, keyHash, perTxnMax);
     }
 
     /**
@@ -337,14 +371,14 @@ contract EMVValidator is IValidator {
         view
         returns (uint256 expectedATC, bool initialized)
     {
-        CardState memory card = emvValidatorStorage[account].cards[keyHash];
-        initialized = card.initialized;
+        CardData storage card = cards[account][keyHash];
+        initialized = _isCardRegistered(card);
         expectedATC = card.atc;
     }
 
     function getExpectedATC(address account, bytes32 keyHash) external view returns (uint256 expectedATC) {
-        CardState memory card = emvValidatorStorage[account].cards[keyHash];
-        if (!card.initialized) {
+        CardData storage card = cards[account][keyHash];
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
         return card.atc;
@@ -355,7 +389,7 @@ contract EMVValidator is IValidator {
     }
 
     function isCardFrozen(address account, bytes32 keyHash) external view returns (bool) {
-        return emvValidatorStorage[account].cards[keyHash].frozen;
+        return cards[account][keyHash].frozen;
     }
 
     function getCardState(address account, bytes32 keyHash)
@@ -363,8 +397,17 @@ contract EMVValidator is IValidator {
         view
         returns (uint256 expectedATC, bool initialized, bool frozen)
     {
-        CardState memory card = emvValidatorStorage[account].cards[keyHash];
-        return (card.atc, card.initialized, card.frozen);
+        CardData storage card = cards[account][keyHash];
+        return (card.atc, _isCardRegistered(card), card.frozen);
+    }
+
+    function getCardLimits(address account, bytes32 keyHash)
+        external
+        view
+        returns (uint64 cycle, uint96 cycleMax, uint96 cycleTotal, uint96 perTxnMax)
+    {
+        CardData storage card = cards[account][keyHash];
+        return (card.cycle, card.cycleMax, card.cycleTotal, card.perTxnMax);
     }
 
     /**
@@ -373,8 +416,12 @@ contract EMVValidator is IValidator {
      * @param unpredictableNumber The unpredictable number to check
      * @return used True if the unpredictable number has been used
      */
-    function isUnpredictableNumberUsed(address account, bytes4 unpredictableNumber) external view returns (bool used) {
-        return emvValidatorStorage[account].usedUnpredictableNumbers[uint32(unpredictableNumber)];
+    function isUnpredictableNumberUsed(address account, bytes32 keyHash, bytes4 unpredictableNumber)
+        external
+        view
+        returns (bool used)
+    {
+        return cards[account][keyHash].usedUnpredictableNumbers[uint32(unpredictableNumber)];
     }
 
     // ========== INTERNAL VALIDATION FUNCTIONS ==========
@@ -527,13 +574,35 @@ contract EMVValidator is IValidator {
     }
 
     /**
-     * @dev Validate replay protection and ATC state without mutating storage
+     * @dev Extract the ISO 8583 amount in two-decimal minor units from packed EMV fields.
+     * @param emvFields The 52-byte EMV fields calldata
+     */
+    function _extractAmountCents(bytes calldata emvFields) internal pure returns (uint96 amount) {
+        (,, uint256 amountOffset,) = _emvFieldOffsets(emvFields);
+
+        for (uint256 i = 0; i < 6;) {
+            uint8 byteValue = uint8(emvFields[amountOffset + i]);
+            uint8 highNibble = byteValue >> 4;
+            uint8 lowNibble = byteValue & 0x0F;
+            if (highNibble > 9 || lowNibble > 9) {
+                revert InvalidAmount();
+            }
+
+            amount = amount * 100 + highNibble * 10 + lowNibble;
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @dev Validate replay protection, ATC, and spending limits without mutating storage
      * @param emvFields The EMV fields calldata to extract data from
      */
-    function _validateReplayProtection(bytes calldata emvFields, address account, bytes32 keyHash)
+    function _validateCardData(bytes calldata emvFields, address account, bytes32 keyHash)
         internal
         view
-        returns (bytes4 unpredictableNumberBytes, uint256 currentATC)
+        returns (bytes4 unpredictableNumberBytes, uint256 currentATC, uint96 amount)
     {
         // Extract values using assembly for efficiency
         (uint256 unpredictableNumberOffset, uint256 atcOffset,,) = _emvFieldOffsets(emvFields);
@@ -546,11 +615,9 @@ contract EMVValidator is IValidator {
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
         uint16 receivedATC = uint16(atcBytes);
 
-        // Cache read-only card state in memory; only the replay bitmap needs storage.
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[account];
-        CardState memory card = accountStorage.cards[keyHash];
+        CardData storage card = cards[account][keyHash];
 
-        if (!card.initialized) {
+        if (!_isCardRegistered(card)) {
             revert PublicKeyNotRegistered();
         }
         if (card.frozen) {
@@ -563,7 +630,7 @@ contract EMVValidator is IValidator {
         }
 
         // Validate replay protection
-        if (accountStorage.usedUnpredictableNumbers[unpredictableNumber]) {
+        if (card.usedUnpredictableNumbers[unpredictableNumber]) {
             revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
 
@@ -572,10 +639,24 @@ contract EMVValidator is IValidator {
             revert InvalidATCSequence(uint16(currentATC), receivedATC);
         }
 
+        amount = _extractAmountCents(emvFields);
+        if (amount > card.perTxnMax) {
+            revert PerTransactionLimitExceeded(keyHash, amount, card.perTxnMax);
+        }
+
+        uint96 cycleTotal = card.cycleTotal;
+        if (_currentCycleTimestamp() >= card.cycle + CYCLE_DURATION) {
+            cycleTotal = 0;
+        }
+        uint256 attemptedTotal = uint256(cycleTotal) + amount;
+        if (attemptedTotal > card.cycleMax) {
+            revert CycleLimitExceeded(keyHash, attemptedTotal, card.cycleMax);
+        }
+
         currentATC = receivedATC;
     }
 
-    function _updateReplayProtectionAndATC(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC)
+    function _updateCardData(bytes32 keyHash, bytes4 unpredictableNumberBytes, uint256 currentATC, uint96 amount)
         internal
     {
         if (currentATC == ATC_MAX) {
@@ -584,12 +665,18 @@ contract EMVValidator is IValidator {
 
         uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
         uint256 nextATC = currentATC + 1;
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
+        CardData storage card = cards[msg.sender][keyHash];
 
-        accountStorage.usedUnpredictableNumbers[unpredictableNumber] = true;
-        CardState storage card = accountStorage.cards[keyHash];
-        card.atc = uint192(nextATC);
-        card.initialized = true;
+        card.usedUnpredictableNumbers[unpredictableNumber] = true;
+        card.atc = uint152(nextATC);
+
+        uint64 currentCycle = _currentCycleTimestamp();
+        if (currentCycle >= card.cycle + CYCLE_DURATION) {
+            card.cycle = currentCycle;
+            card.cycleTotal = amount;
+        } else {
+            card.cycleTotal += amount;
+        }
 
         emit ReplayProtectionUpdated(msg.sender, keyHash, unpredictableNumberBytes, nextATC);
     }
@@ -639,7 +726,19 @@ contract EMVValidator is IValidator {
         return computeKeyHash(pubkeyX, pubkeyY) == keyHash;
     }
 
+    function _isCardRegistered(CardData storage card) internal view returns (bool) {
+        return card.cycle != 0;
+    }
+
+    function _currentCycleTimestamp() internal view returns (uint64) {
+        uint256 timestamp = block.timestamp;
+        if (timestamp == 0) {
+            return 1;
+        }
+        return uint64(timestamp);
+    }
+
     function _isPublicKeyRegistered(address account, bytes32 keyHash) internal view returns (bool) {
-        return emvValidatorStorage[account].cards[keyHash].initialized;
+        return _isCardRegistered(cards[account][keyHash]);
     }
 }
