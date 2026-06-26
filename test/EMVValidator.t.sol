@@ -5,7 +5,7 @@ import "lib/kernel/test/base/KernelTestBase.sol";
 import {EMVValidator, EMVTransactionData} from "../src/EMVValidator.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
-import {ANSEncoding} from "../src/ANSEncoding.sol";
+import {ANSEncoding} from "../src/util/ANSEncoding.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "kernel/src/types/Constants.sol";
 import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";

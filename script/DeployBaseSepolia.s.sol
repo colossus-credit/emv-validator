@@ -3,7 +3,7 @@ pragma solidity ^0.8.23;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
-import {ColossusTestToken} from "../src/ColossusTestToken.sol";
+import {ColossusTestToken} from "../test/util/ColossusTestToken.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {EMVValidator} from "../src/EMVValidator.sol";
 import {IERC7579Account} from "kernel/src/interfaces/IERC7579Account.sol";

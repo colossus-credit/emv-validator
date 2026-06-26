@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.23;
 
-import {ANSEncoding} from "./ANSEncoding.sol";
+import {ANSEncoding} from "./util/ANSEncoding.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 
 /**
