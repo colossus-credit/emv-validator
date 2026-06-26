@@ -28,6 +28,8 @@ contract EMVCardPolicy is PolicyBase {
     error InvalidSignatureLength(uint256 actualSize);
     error PublicKeyNotRegistered();
     error InvalidPublicKeySize();
+    error InvalidPublicKey();
+    error UnexpectedPublicKey(bytes32 expected, bytes32 actual);
     error ATCExhausted(bytes32 keyHash);
     error CardFrozen(bytes32 keyHash);
 
@@ -80,13 +82,14 @@ contract EMVCardPolicy is PolicyBase {
         if (keyHash == bytes32(0)) {
             revert PublicKeyNotRegistered();
         }
+        _validateSignatureKey(keyHash, userOp.signature);
 
         bytes calldata emvFields = EMVCallData.extractEMVFields(userOp.callData);
         _validateAndUpdateCard(msg.sender, keyHash, emvFields);
         return SIG_VALIDATION_SUCCESS_UINT;
     }
 
-    function checkSignaturePolicy(bytes32 id, address sender, bytes32, bytes calldata)
+    function checkSignaturePolicy(bytes32 id, address sender, bytes32, bytes calldata sig)
         external
         view
         override
@@ -96,6 +99,7 @@ contract EMVCardPolicy is PolicyBase {
         if (keyHash == bytes32(0)) {
             revert PublicKeyNotRegistered();
         }
+        _validateSignatureKey(keyHash, sig);
 
         CardData storage card = cards[sender][keyHash];
         if (card.atc == 0) {
@@ -241,5 +245,31 @@ contract EMVCardPolicy is PolicyBase {
         card.atc = uint64(nextATC + 1);
 
         emit ReplayProtectionUpdated(account, keyHash, unpredictableNumberBytes, nextATC);
+    }
+
+    function _validateSignatureKey(bytes32 expectedKeyHash, bytes calldata signature) internal pure {
+        (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY) = _decodeEMVSignatureKey(signature);
+        if (computeKeyHash(pubkeyX, pubkeyY) != keyHash) {
+            revert InvalidPublicKey();
+        }
+        if (keyHash != expectedKeyHash) {
+            revert UnexpectedPublicKey(expectedKeyHash, keyHash);
+        }
+    }
+
+    function _decodeEMVSignatureKey(bytes calldata signature)
+        internal
+        pure
+        returns (bytes32 keyHash, bytes32 pubkeyX, bytes32 pubkeyY)
+    {
+        if (signature.length != 160) {
+            revert InvalidSignatureLength(signature.length);
+        }
+
+        assembly {
+            keyHash := calldataload(signature.offset)
+            pubkeyX := calldataload(add(signature.offset, 32))
+            pubkeyY := calldataload(add(signature.offset, 64))
+        }
     }
 }
