@@ -8,12 +8,7 @@ import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {EMVSigner} from "../src/EMVSigner.sol";
 import {EMVCardPolicy} from "../src/policy/EMVCardPolicy.sol";
 import {EMVLimitPolicy} from "../src/policy/EMVLimitPolicy.sol";
-import {
-    MODULE_TYPE_EXECUTOR,
-    MODULE_TYPE_POLICY,
-    MODULE_TYPE_SIGNER,
-    MODULE_TYPE_VALIDATOR
-} from "kernel/src/types/Constants.sol";
+import {MODULE_TYPE_EXECUTOR, MODULE_TYPE_POLICY, MODULE_TYPE_SIGNER} from "kernel/src/types/Constants.sol";
 
 contract SmokeBaseSepolia is Script {
     uint256 private constant BASE_SEPOLIA_CHAIN_ID = 84532;
@@ -66,7 +61,6 @@ contract SmokeBaseSepolia is Script {
         _assertTrue(settlement.isModuleType(MODULE_TYPE_EXECUTOR), "settlement executor module type");
         _assertTrue(settlement.isInitialized(address(0)), "settlement initialized");
 
-        _assertTrue(signer.isModuleType(MODULE_TYPE_VALIDATOR), "signer validator module type");
         _assertTrue(signer.isModuleType(MODULE_TYPE_SIGNER), "signer module type");
         _assertTrue(signer.isInitialized(address(0)), "signer initialized");
         _assertTrue(cardPolicy.isModuleType(MODULE_TYPE_POLICY), "card policy module type");

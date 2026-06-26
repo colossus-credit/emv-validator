@@ -2,7 +2,7 @@
 pragma solidity ^0.8.23;
 
 import "lib/kernel/test/base/KernelTestBase.sol";
-import {EMVSigner, EMVTransactionData} from "../src/EMVSigner.sol";
+import {EMVSigner, EMVTransactionData, IKernelPermissionConfig} from "../src/EMVSigner.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {EMVCardPolicy} from "../src/policy/EMVCardPolicy.sol";
@@ -11,7 +11,10 @@ import {ANSEncoding} from "../src/util/ANSEncoding.sol";
 import {EMVCallData} from "../src/util/EMVCallData.sol";
 import {DeployBaseSepolia} from "../script/DeployBaseSepolia.s.sol";
 import {SIG_VALIDATION_SUCCESS_UINT, SIG_VALIDATION_FAILED_UINT} from "kernel/src/types/Constants.sol";
+import {ISigner as KernelISigner} from "kernel/src/interfaces/IERC7579Modules.sol";
 import {PackedUserOperation as KernelUserOp} from "kernel/src/interfaces/PackedUserOperation.sol";
+import {PolicyData as KernelPolicyData} from "kernel/src/types/Types.sol";
+import {ValidatorLib as KernelValidatorLib} from "kernel/src/utils/ValidationTypeLib.sol";
 import {P256} from "solady/utils/P256.sol";
 import "forge-std/console.sol";
 
@@ -76,6 +79,42 @@ contract MaliciousEMVDelegate {
 
     function execute(bytes calldata) external {
         IERC20Transfer(token).transfer(recipient, amount);
+    }
+}
+
+contract MockPermissionAccount {
+    EMVSigner immutable signerModule;
+    address immutable callPolicy;
+    EMVCardPolicy immutable cardPolicy;
+    EMVLimitPolicy immutable limitPolicy;
+    KernelISigner configuredSigner;
+
+    constructor(EMVSigner signerModule_, address callPolicy_, EMVCardPolicy cardPolicy_, EMVLimitPolicy limitPolicy_) {
+        signerModule = signerModule_;
+        callPolicy = callPolicy_;
+        cardPolicy = cardPolicy_;
+        limitPolicy = limitPolicy_;
+        configuredSigner = KernelISigner(address(signerModule_));
+    }
+
+    function installSigner(bytes32 permission, bytes memory signerData) external {
+        signerModule.onInstall(abi.encodePacked(permission, signerData));
+    }
+
+    function setConfiguredSigner(KernelISigner signer_) external {
+        configuredSigner = signer_;
+    }
+
+    function permissionConfig(PermissionId)
+        external
+        view
+        returns (IKernelPermissionConfig.PermissionConfig memory config)
+    {
+        config.policyData = new KernelPolicyData[](3);
+        config.policyData[0] = KernelValidatorLib.encodePolicyData(false, true, callPolicy);
+        config.policyData[1] = KernelValidatorLib.encodePolicyData(false, false, address(cardPolicy));
+        config.policyData[2] = KernelValidatorLib.encodePolicyData(false, true, address(limitPolicy));
+        config.signer = configuredSigner;
     }
 }
 
@@ -231,59 +270,16 @@ contract EMVSignerTest is KernelTestBase {
         console.log("Test contract balance from mockERC20:", balance);
     }
 
-    // Helper to install EMVSigner as validator, executor, and hook
+    // Legacy helper name kept for older tests; this now installs the safe permission bundle.
     function _installEMVSigner() internal {
-        vm.deal(address(kernel), 1e18);
+        _installEMVPermissionWithPolicies(type(uint64).max, type(uint64).max);
+    }
 
-        // Install EMVSigner as validator with public key registration
-        PackedUserOperation[] memory ops1 = new PackedUserOperation[](1);
-        ops1[0] = _prepareUserOp(
-            VALIDATION_TYPE_ROOT,
-            false,
-            false,
-            abi.encodeWithSelector(
-                kernel.installModule.selector,
-                MODULE_TYPE_VALIDATOR,
-                address(emvSigner),
-                abi.encodePacked(
-                    address(0), // No hook for validator
-                    abi.encode(
-                        abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y), // validator data - ATC + P-256 pubkey
-                        hex"", // hook data
-                        abi.encodePacked(kernel.execute.selector) // selector data - grant access to execute
-                    )
-                )
-            ),
-            true,
-            true,
-            false
-        );
-        entrypoint.handleOps(ops1, payable(address(0xdeadbeef)));
-
-        // Install EMVSettlement as executor
-        PackedUserOperation[] memory ops2 = new PackedUserOperation[](1);
-        ops2[0] = _prepareUserOp(
-            VALIDATION_TYPE_ROOT,
-            false,
-            false,
-            abi.encodeWithSelector(
-                kernel.installModule.selector,
-                MODULE_TYPE_EXECUTOR,
-                address(emvSettlement),
-                abi.encodePacked(
-                    address(0), // No hook for executor
-                    abi.encode(
-                        abi.encode(address(mockERC20), address(acquirerConfig), uint8(18)), // executor data - configure token, registry, and decimals
-                        hex"", // hook data
-                        hex"" // selector data
-                    )
-                )
-            ),
-            true,
-            true,
-            false
-        );
-        entrypoint.handleOps(ops2, payable(address(0xdeadbeef)));
+    function _installLocalEMVSignerPermission() internal returns (address account) {
+        MockPermissionAccount mockAccount =
+            new MockPermissionAccount(emvSigner, address(callPolicy), emvCardPolicy, emvLimitPolicy);
+        mockAccount.installSigner(_emvPermissionKey(), _signerInstallConfig(TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        return address(mockAccount);
     }
 
     function _emvPermission() internal pure returns (PermissionId) {
@@ -368,8 +364,15 @@ contract EMVSignerTest is KernelTestBase {
     function _signerPermissionData(bytes32 pubkeyX, bytes32 pubkeyY) internal view returns (bytes memory) {
         return abi.encodePacked(
             PolicyData.unwrap(ValidatorLib.encodePolicyData(false, true, address(emvSigner))),
-            abi.encode(uint16(0), pubkeyX, pubkeyY)
+            _signerInstallConfig(pubkeyX, pubkeyY)
         );
+    }
+
+    function _signerInstallConfig(bytes32 pubkeyX, bytes32 pubkeyY) internal view returns (bytes memory) {
+        return
+            abi.encode(
+                uint16(0), pubkeyX, pubkeyY, address(callPolicy), address(emvCardPolicy), address(emvLimitPolicy)
+            );
     }
 
     function _installEMVPermission(bytes[] memory permissions) internal {
@@ -559,33 +562,7 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function _prepareEMVUserOp(bytes memory callData, bool success) internal returns (PackedUserOperation memory op) {
-        // Create a UserOperation that uses EMVSigner as the validator
-        uint192 nonceKey = ValidatorLib.encodeAsNonceKey(
-            ValidationMode.unwrap(VALIDATION_MODE_DEFAULT),
-            ValidationType.unwrap(VALIDATION_TYPE_VALIDATOR),
-            bytes20(address(emvSigner)),
-            0 // parallel key
-        );
-
-        // Prepare signature: valid P-256 envelope or invalid short signature
-        bytes memory signature;
-        if (success) {
-            signature = _createEMVSignature();
-        } else {
-            signature = hex"deadbeef";
-        }
-
-        op = PackedUserOperation({
-            sender: address(kernel),
-            nonce: entrypoint.getNonce(address(kernel), nonceKey),
-            initCode: "",
-            callData: callData, // Contains EMV fields embedded in kernel.execute call
-            accountGasLimits: bytes32(abi.encodePacked(uint128(1000000), uint128(1000000))),
-            preVerificationGas: 1000000,
-            gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
-            paymasterAndData: "",
-            signature: signature
-        });
+        op = _prepareEMVPermissionUserOp(callData, success);
     }
 
     function _prepareEMVPermissionUserOp(bytes memory callData, bool success)
@@ -652,7 +629,8 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function test_ModuleType() public {
-        assertTrue(emvSigner.isModuleType(MODULE_TYPE_VALIDATOR));
+        assertFalse(emvSigner.isModuleType(MODULE_TYPE_VALIDATOR));
+        assertTrue(emvSigner.isModuleType(MODULE_TYPE_SIGNER));
         assertFalse(emvSigner.isModuleType(MODULE_TYPE_EXECUTOR));
         assertFalse(emvSigner.isModuleType(MODULE_TYPE_HOOK));
         assertFalse(emvSigner.isModuleType(MODULE_TYPE_FALLBACK));
@@ -661,6 +639,37 @@ contract EMVSignerTest is KernelTestBase {
         assertTrue(emvSettlement.isModuleType(MODULE_TYPE_EXECUTOR));
         assertFalse(emvSettlement.isModuleType(MODULE_TYPE_VALIDATOR));
         assertFalse(emvSettlement.isModuleType(MODULE_TYPE_HOOK));
+    }
+
+    function test_EMVSignerCannotBeInstalledAsStandaloneValidator() public whenInitialized {
+        vm.deal(address(kernel), 1e18);
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _prepareUserOp(
+            VALIDATION_TYPE_ROOT,
+            false,
+            false,
+            abi.encodeWithSelector(
+                kernel.installModule.selector,
+                MODULE_TYPE_VALIDATOR,
+                address(emvSigner),
+                abi.encodePacked(
+                    address(0),
+                    abi.encode(
+                        abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y),
+                        hex"",
+                        abi.encodePacked(kernel.execute.selector)
+                    )
+                )
+            ),
+            true,
+            true,
+            false
+        );
+
+        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
+        assertFalse(kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""));
+        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), bytes32(0)), bytes32(0));
     }
 
     function test_InvalidCallDataValidation() public whenInitialized {
@@ -682,10 +691,9 @@ contract EMVSignerTest is KernelTestBase {
         // Install EMVSigner as both validator and executor
         _installEMVSigner();
 
-        // Verify that EMVSigner was installed properly
-        assertTrue(
-            kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""), "EMVSigner should be installed"
-        );
+        ValidationManager.PermissionConfig memory config = kernel.permissionConfig(_emvPermission());
+        assertEq(address(config.signer), address(emvSigner));
+        assertFalse(kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""));
 
         // Check test contract balance first
         uint256 testBalance = mockERC20.balanceOf(address(this));
@@ -813,12 +821,12 @@ contract EMVSignerTest is KernelTestBase {
         _expectEMVLimitPolicyFailure(_createEMVFieldsWithByte(21, bytes1(0x03)));
     }
 
-    function test_InstallEMVAsValidatorAndExecutor() public whenInitialized {
-        // Install EMVSigner as both validator and executor
+    function test_InstallEMVAsPermissionSignerAndExecutor() public whenInitialized {
         _installEMVSigner();
 
-        // Check that both modules were installed
-        assertTrue(kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""));
+        ValidationManager.PermissionConfig memory config = kernel.permissionConfig(_emvPermission());
+        assertEq(address(config.signer), address(emvSigner));
+        assertFalse(kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""));
         assertTrue(kernel.isModuleInstalled(MODULE_TYPE_EXECUTOR, address(emvSettlement), ""));
     }
 
@@ -909,12 +917,11 @@ contract EMVSignerTest is KernelTestBase {
         bytes32 zeroPubkeyX = bytes32(0);
         bytes32 zeroPubkeyY = bytes32(0);
 
-        // Create a new validator for this test
         EMVSigner testValidator = new EMVSigner();
 
         // Try to install with zero public key - should fail with InvalidPublicKeySize
         vm.expectRevert(EMVSigner.InvalidPublicKeySize.selector);
-        testValidator.onInstall(abi.encode(uint16(0), zeroPubkeyX, zeroPubkeyY));
+        testValidator.onInstall(abi.encodePacked(_emvPermissionKey(), _signerInstallConfig(zeroPubkeyX, zeroPubkeyY)));
     }
 
     // Note: Direct validateUserOp gas measurement test removed due to memory/calldata conversion issues
@@ -1142,7 +1149,7 @@ contract EMVSignerTest is KernelTestBase {
         );
     }
 
-    function test_EMVPermissionWithoutCardPolicyDoesNotProvideReplayProtection() public whenInitialized {
+    function test_EMVPermissionWithoutCardPolicyCannotInstallSigner() public whenInitialized {
         bytes[] memory permissions = new bytes[](3);
         permissions[0] = _callPolicyPermissionData();
         permissions[1] = _limitPolicyPermissionData(type(uint64).max, type(uint64).max);
@@ -1150,24 +1157,27 @@ contract EMVSignerTest is KernelTestBase {
 
         _installEMVPermission(permissions);
 
-        bytes memory signerOnlySignature = abi.encodePacked(bytes1(0xff), _createEMVSignature());
-        uint256 merchantBalanceBefore = mockERC20.balanceOf(merchantAddress);
-
-        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = _prepareEMVPermissionUserOp(_encodeSimpleTransferCall(), true);
-        ops[0].signature = signerOnlySignature;
-        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
-
-        ops[0] = _prepareEMVPermissionUserOp(_encodeSimpleTransferCall(), true);
-        ops[0].signature = signerOnlySignature;
-        entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
-
-        uint256 expectedMerchantAmount = 971e17;
-        assertEq(mockERC20.balanceOf(merchantAddress) - merchantBalanceBefore, expectedMerchantAmount * 2);
+        ValidationManager.PermissionConfig memory config = kernel.permissionConfig(_emvPermission());
+        assertEq(address(config.signer), address(0));
+        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
         assertEq(emvCardPolicy.getPermissionKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
     }
 
-    function test_EMVPermissionWithoutCallPolicyCanDelegatecallUnapprovedTarget() public whenInitialized {
+    function test_EMVPermissionWithoutLimitPolicyCannotInstallSigner() public whenInitialized {
+        bytes[] memory permissions = new bytes[](3);
+        permissions[0] = _callPolicyPermissionData();
+        permissions[1] = _cardPolicyPermissionData(TEST_PUBKEY_X, TEST_PUBKEY_Y);
+        permissions[2] = _signerPermissionData(TEST_PUBKEY_X, TEST_PUBKEY_Y);
+
+        _installEMVPermission(permissions);
+
+        ValidationManager.PermissionConfig memory config = kernel.permissionConfig(_emvPermission());
+        assertEq(address(config.signer), address(0));
+        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
+        assertEq(emvCardPolicy.getPermissionKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
+    }
+
+    function test_EMVPermissionWithoutCallPolicyCannotInstallSigner() public whenInitialized {
         bytes[] memory permissions = new bytes[](3);
         permissions[0] = _cardPolicyPermissionData(TEST_PUBKEY_X, TEST_PUBKEY_Y);
         permissions[1] = _limitPolicyPermissionData(type(uint64).max, type(uint64).max);
@@ -1187,9 +1197,14 @@ contract EMVSignerTest is KernelTestBase {
         ops[0].signature = _createEMVPermissionSignatureForCardPolicy(0, _createEMVSignature(), _createEMVSignature());
 
         uint256 merchantBalanceBefore = mockERC20.balanceOf(merchantAddress);
+        vm.expectRevert();
         entrypoint.handleOps(ops, payable(address(0xdeadbeef)));
 
-        assertEq(mockERC20.balanceOf(attacker), stolenAmount);
+        ValidationManager.PermissionConfig memory config = kernel.permissionConfig(_emvPermission());
+        assertEq(address(config.signer), address(0));
+        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
+        assertEq(emvCardPolicy.getPermissionKeyHash(address(kernel), _emvPermissionKey()), bytes32(0));
+        assertEq(mockERC20.balanceOf(attacker), 0);
         assertEq(mockERC20.balanceOf(merchantAddress), merchantBalanceBefore);
     }
 
@@ -1356,37 +1371,40 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function test_EMVSignerRejectsTamperedSignatureKeyEnvelope() public whenInitialized {
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        address account = _installLocalEMVSignerPermission();
 
         KernelUserOp memory op;
-        op.sender = address(this);
+        op.sender = account;
         op.callData = _encodeSimpleTransferCall();
         op.signature = abi.encodePacked(_testKeyHash(), OTHER_PUBKEY_X, OTHER_PUBKEY_Y, TEST_SIGNATURE);
 
+        vm.prank(account);
         vm.expectRevert(EMVSigner.InvalidPublicKey.selector);
-        emvSigner.validateUserOp(op, bytes32(0));
+        emvSigner.checkUserOpSignature(_emvPermissionKey(), op, bytes32(0));
     }
 
     function test_EMVSignerRejectsUnauthorizedSignatureKeyEnvelope() public whenInitialized {
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        address account = _installLocalEMVSignerPermission();
 
         KernelUserOp memory op;
-        op.sender = address(this);
+        op.sender = account;
         op.callData = _encodeSimpleTransferCall();
         op.signature = _createEMVSignatureForKey(OTHER_PUBKEY_X, OTHER_PUBKEY_Y);
 
+        vm.prank(account);
         vm.expectRevert(EMVSigner.PublicKeyNotRegistered.selector);
-        emvSigner.validateUserOp(op, bytes32(0));
+        emvSigner.checkUserOpSignature(_emvPermissionKey(), op, bytes32(0));
     }
 
     function test_EMVSignerPermissionModeRejectsUnauthorizedSignatureKeyEnvelope() public whenInitialized {
-        emvSigner.onInstall(abi.encodePacked(_emvPermissionKey(), abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y)));
+        address account = _installLocalEMVSignerPermission();
 
         KernelUserOp memory op;
-        op.sender = address(this);
+        op.sender = account;
         op.callData = _encodeSimpleTransferCall();
         op.signature = _createEMVSignatureForKey(OTHER_PUBKEY_X, OTHER_PUBKEY_Y);
 
+        vm.prank(account);
         vm.expectRevert(EMVSigner.PublicKeyNotRegistered.selector);
         emvSigner.checkUserOpSignature(_emvPermissionKey(), op, bytes32(0));
     }
@@ -1912,40 +1930,90 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function test_EMVSignerErrors() public {
-        // Test onInstall with empty data
         EMVSigner testValidator = new EMVSigner();
+
         vm.expectRevert(EMVSigner.InvalidConfig.selector);
         testValidator.onInstall("");
+
+        vm.expectRevert(EMVSigner.StandaloneValidatorDisabled.selector);
+        testValidator.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+
+        vm.expectRevert(EMVSigner.InvalidConfig.selector);
+        testValidator.onUninstall("");
     }
 
     function test_EMVSignerUninstall() public whenInitialized {
-        _installEMVSigner();
+        address account = _installLocalEMVSignerPermission();
 
         bytes32 keyHash = _testKeyHash();
 
-        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), bytes32(0)), keyHash);
+        assertEq(emvSigner.getAuthorizedKeyHash(account, _emvPermissionKey()), keyHash);
 
-        // Call onUninstall
-        vm.prank(address(kernel));
-        emvSigner.onUninstall("");
+        vm.prank(account);
+        emvSigner.onUninstall(abi.encodePacked(_emvPermissionKey()));
 
         // isInitialized remains an unconditional interface response.
-        assertTrue(emvSigner.isInitialized(address(kernel)));
-        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), bytes32(0)), bytes32(0));
+        assertTrue(emvSigner.isInitialized(account));
+        assertEq(emvSigner.getAuthorizedKeyHash(account, _emvPermissionKey()), bytes32(0));
     }
 
     function test_EMVSignerIsInitialized() public {
-        // Create a new validator
         EMVSigner testValidator = new EMVSigner();
 
         // EMVSigner does not track account-level initialization for this interface method.
         assertTrue(testValidator.isInitialized(address(this)));
 
-        // Install it with public key
-        testValidator.onInstall(abi.encode(uint16(1), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        MockPermissionAccount mockAccount =
+            new MockPermissionAccount(testValidator, address(callPolicy), emvCardPolicy, emvLimitPolicy);
+        mockAccount.installSigner(_emvPermissionKey(), _signerInstallConfig(TEST_PUBKEY_X, TEST_PUBKEY_Y));
 
         // The interface response remains unconditional after installation.
-        assertTrue(testValidator.isInitialized(address(this)));
+        assertTrue(testValidator.isInitialized(address(mockAccount)));
+    }
+
+    function test_EMVSignerRequiresInstalledPolicyBundle() public whenInitialized {
+        EMVSigner testValidator = new EMVSigner();
+        address missingPolicy = makeAddr("missingPolicy");
+
+        MockPermissionAccount mockAccount =
+            new MockPermissionAccount(testValidator, missingPolicy, emvCardPolicy, emvLimitPolicy);
+
+        vm.expectRevert(abi.encodeWithSelector(EMVSigner.RequiredPolicyMissing.selector, address(callPolicy)));
+        mockAccount.installSigner(_emvPermissionKey(), _signerInstallConfig(TEST_PUBKEY_X, TEST_PUBKEY_Y));
+    }
+
+    function test_EMVSignerRequiresCurrentPermissionSigner() public whenInitialized {
+        EMVSigner testValidator = new EMVSigner();
+
+        MockPermissionAccount mockAccount =
+            new MockPermissionAccount(testValidator, address(callPolicy), emvCardPolicy, emvLimitPolicy);
+        mockAccount.setConfiguredSigner(KernelISigner(address(emvSigner)));
+
+        vm.expectRevert(EMVSigner.InvalidRequiredPolicy.selector);
+        mockAccount.installSigner(_emvPermissionKey(), _signerInstallConfig(TEST_PUBKEY_X, TEST_PUBKEY_Y));
+    }
+
+    function test_EMVSignerRequiresNonZeroPolicyBundle() public {
+        bytes memory signerData = abi.encode(
+            uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y, address(0), address(emvCardPolicy), address(emvLimitPolicy)
+        );
+
+        vm.expectRevert(EMVSigner.InvalidRequiredPolicy.selector);
+        emvSigner.onInstall(abi.encodePacked(_emvPermissionKey(), signerData));
+    }
+
+    function test_EMVSignerRejectsLegacyPermissionInstallData() public {
+        bytes memory legacyPermissionSignerData = abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y);
+
+        vm.expectRevert(EMVSigner.InvalidConfig.selector);
+        emvSigner.onInstall(abi.encodePacked(_emvPermissionKey(), legacyPermissionSignerData));
+    }
+
+    function test_EMVSignerRejectsUnknownInstallDataLength() public {
+        vm.expectRevert(EMVSigner.InvalidConfig.selector);
+        emvSigner.onInstall(
+            abi.encodePacked(_emvPermissionKey(), abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y), bytes1(0x01))
+        );
     }
 
     function test_CallPolicyValidationConfig() public {
@@ -2045,19 +2113,15 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function test_EMVSignerERC1271Validation() public {
-        // Install the validator with public key for this test contract
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        address account = _installLocalEMVSignerPermission();
 
-        // For P-256 EMV, the signature is over the full 52-byte validator payload.
         bytes32 signedDataHash = _signedPayloadHash();
 
-        // Test isValidSignatureWithSender - should return ERC1271_MAGICVALUE for valid signature
-        bytes4 result = emvSigner.isValidSignatureWithSender(address(this), signedDataHash, _createEMVSignature());
+        bytes4 result = emvSigner.checkSignature(_emvPermissionKey(), account, signedDataHash, _createEMVSignature());
         assertEq(result, ERC1271_MAGICVALUE);
 
-        // Test with invalid signature (wrong hash)
         bytes32 wrongHash = keccak256("wrong data");
-        bytes4 invalidResult = emvSigner.isValidSignatureWithSender(address(this), wrongHash, _createEMVSignature());
+        bytes4 invalidResult = emvSigner.checkSignature(_emvPermissionKey(), account, wrongHash, _createEMVSignature());
         assertEq(invalidResult, ERC1271_INVALID);
     }
 
@@ -2530,17 +2594,17 @@ contract EMVSignerTest is KernelTestBase {
     }
 
     function test_InvalidSender() public {
-        // Install validator first
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        _installLocalEMVSignerPermission();
 
         bytes32 testHash = keccak256("test");
 
-        // Try to call isValidSignatureWithSender with address(0) as sender - should revert
         vm.expectRevert(EMVSigner.InvalidSender.selector);
-        emvSigner.isValidSignatureWithSender(address(0), testHash, TEST_SIGNATURE);
+        emvSigner.checkSignature(_emvPermissionKey(), address(0), testHash, TEST_SIGNATURE);
     }
 
     function test_InvalidSender_WithInvalidSignature() public {
+        _installLocalEMVSignerPermission();
+
         // This test verifies that InvalidSender is caught BEFORE signature validation
         // Even with completely invalid signature data, InvalidSender should be the error
 
@@ -2548,10 +2612,8 @@ contract EMVSignerTest is KernelTestBase {
         bytes memory invalidSigData = hex"deadbeefcafebabe";
         bytes32 testHash = keccak256("test");
 
-        // Try to call isValidSignatureWithSender with address(0) as sender
-        // Should revert with InvalidSender, NOT with signature validation errors
         vm.expectRevert(EMVSigner.InvalidSender.selector);
-        emvSigner.isValidSignatureWithSender(address(0), testHash, invalidSigData);
+        emvSigner.checkSignature(_emvPermissionKey(), address(0), testHash, invalidSigData);
     }
 
     function test_PublicKeyNotRegistered() public {
@@ -2561,12 +2623,11 @@ contract EMVSignerTest is KernelTestBase {
 
         // Try to validate signature for an account that never installed the validator
         vm.expectRevert(EMVSigner.PublicKeyNotRegistered.selector);
-        emvSigner.isValidSignatureWithSender(uninitializedAccount, testHash, _createEMVSignature());
+        emvSigner.checkSignature(_emvPermissionKey(), uninitializedAccount, testHash, _createEMVSignature());
     }
 
     function test_InvalidSignatureLength_WrongSignatureLength() public {
-        // Install validator first
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        address account = _installLocalEMVSignerPermission();
 
         bytes32 dynamicDataHash = _signedPayloadHash();
 
@@ -2574,13 +2635,12 @@ contract EMVSignerTest is KernelTestBase {
         bytes memory shortSignature = new bytes(32);
 
         // Should return INVALID, not revert (ERC-1271 behavior)
-        bytes4 result = emvSigner.isValidSignatureWithSender(address(this), dynamicDataHash, shortSignature);
+        bytes4 result = emvSigner.checkSignature(_emvPermissionKey(), account, dynamicDataHash, shortSignature);
         assertEq(result, ERC1271_INVALID, "Should return INVALID for wrong signature length");
     }
 
     function test_InvalidSignatureLength_EmptySignature() public {
-        // Install validator first
-        emvSigner.onInstall(abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y));
+        address account = _installLocalEMVSignerPermission();
 
         bytes32 dynamicDataHash = _signedPayloadHash();
 
@@ -2588,8 +2648,23 @@ contract EMVSignerTest is KernelTestBase {
         bytes memory emptySignature = hex"";
 
         // Should return INVALID, not revert (ERC-1271 behavior)
-        bytes4 result = emvSigner.isValidSignatureWithSender(address(this), dynamicDataHash, emptySignature);
+        bytes4 result = emvSigner.checkSignature(_emvPermissionKey(), account, dynamicDataHash, emptySignature);
         assertEq(result, ERC1271_INVALID, "Should return INVALID for empty signature");
+    }
+
+    function test_EMVSignerStandaloneERC1271Disabled() public {
+        (bool success, bytes memory returndata) = address(emvSigner)
+            .staticcall(
+                abi.encodeWithSelector(
+                    emvSigner.isValidSignatureWithSender.selector,
+                    address(this),
+                    _signedPayloadHash(),
+                    _createEMVSignature()
+                )
+            );
+
+        assertFalse(success);
+        assertEq(bytes4(returndata), EMVSigner.StandaloneValidatorDisabled.selector);
     }
 
     // ========== P-256 END-TO-END TESTS ==========
@@ -2617,68 +2692,19 @@ contract EMVSignerTest is KernelTestBase {
 
         console.log("=== Acquirer Configuration Complete ===");
 
-        // STEP 3: Install EMVSigner with P-256 public key
-        PackedUserOperation[] memory installValOps = new PackedUserOperation[](1);
-        installValOps[0] = _prepareUserOp(
-            VALIDATION_TYPE_ROOT,
-            false,
-            false,
-            abi.encodeWithSelector(
-                kernel.installModule.selector,
-                MODULE_TYPE_VALIDATOR,
-                address(emvSigner),
-                abi.encodePacked(
-                    address(0),
-                    abi.encode(
-                        abi.encode(uint16(0), TEST_PUBKEY_X, TEST_PUBKEY_Y),
-                        hex"",
-                        abi.encodePacked(kernel.execute.selector)
-                    )
-                )
-            ),
-            true,
-            true,
-            false
-        );
+        // STEP 3: Install the full permission bundle: CallPolicy, EMVCardPolicy, EMVLimitPolicy, and EMVSigner.
+        _installEMVSigner();
 
-        entrypoint.handleOps(installValOps, payable(address(0xdeadbeef)));
-
-        // Verify EMVSigner was installed
-        assertTrue(
-            kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""), "EMVSigner should be installed"
-        );
-        console.log("=== EMVSigner Installed ===");
-
-        // STEP 4: Install EMVSettlement executor
-        PackedUserOperation[] memory installExecOps = new PackedUserOperation[](1);
-        installExecOps[0] = _prepareUserOp(
-            VALIDATION_TYPE_ROOT,
-            false,
-            false,
-            abi.encodeWithSelector(
-                kernel.installModule.selector,
-                MODULE_TYPE_EXECUTOR,
-                address(emvSettlement),
-                abi.encodePacked(
-                    address(0),
-                    abi.encode(abi.encode(address(mockERC20), address(acquirerConfig), uint8(18)), hex"", hex"")
-                )
-            ),
-            true,
-            true,
-            false
-        );
-
-        entrypoint.handleOps(installExecOps, payable(address(0xdeadbeef)));
-
-        // Verify EMVSettlement was installed
+        ValidationManager.PermissionConfig memory permissionConfig = kernel.permissionConfig(_emvPermission());
+        assertEq(address(permissionConfig.signer), address(emvSigner), "EMVSigner should be permission signer");
+        assertFalse(kernel.isModuleInstalled(MODULE_TYPE_VALIDATOR, address(emvSigner), ""));
         assertTrue(
             kernel.isModuleInstalled(MODULE_TYPE_EXECUTOR, address(emvSettlement), ""),
             "EMVSettlement should be installed"
         );
-        console.log("=== EMVSettlement Installed ===");
+        console.log("=== EMV Permission Bundle Installed ===");
 
-        // STEP 5: Fund the kernel with tokens
+        // STEP 4: Fund the kernel with tokens
         uint256 transferAmount = 1e20; // 100 tokens ($100)
         mockERC20.transfer(address(kernel), transferAmount * 2); // 2x for fees
         vm.deal(address(kernel), 10 ether); // Ensure ETH for gas
@@ -2689,14 +2715,6 @@ contract EMVSignerTest is KernelTestBase {
         console.log("=== Kernel Funded ===");
         console.log("Kernel ERC20 balance:", kernelBalanceBefore);
 
-        // STEP 6: Create UserOperation with EMV data in callData and P-256 signature in signature
-        uint192 nonceKey = ValidatorLib.encodeAsNonceKey(
-            ValidationMode.unwrap(VALIDATION_MODE_DEFAULT),
-            ValidationType.unwrap(VALIDATION_TYPE_VALIDATOR),
-            bytes20(address(emvSigner)),
-            0
-        );
-
         bytes memory emvCallData = abi.encodeWithSelector(
             kernel.execute.selector,
             ExecLib.encode(
@@ -2706,17 +2724,7 @@ contract EMVSignerTest is KernelTestBase {
         );
 
         PackedUserOperation[] memory emvOps = new PackedUserOperation[](1);
-        emvOps[0] = PackedUserOperation({
-            sender: address(kernel),
-            nonce: entrypoint.getNonce(address(kernel), nonceKey),
-            initCode: "",
-            callData: emvCallData,
-            accountGasLimits: bytes32(abi.encodePacked(uint128(2000000), uint128(2000000))),
-            preVerificationGas: 2000000,
-            gasFees: bytes32(abi.encodePacked(uint128(1), uint128(1))),
-            paymasterAndData: "",
-            signature: _createEMVSignature()
-        });
+        emvOps[0] = _prepareEMVPermissionUserOp(emvCallData, true);
 
         console.log("=== Executing EMV Transaction ===");
 
@@ -2745,8 +2753,8 @@ contract EMVSignerTest is KernelTestBase {
         uint256 merchantReceived = merchantBalanceAfter - merchantBalanceBefore;
         assertEq(merchantReceived, expectedMerchantAmount, "Merchant should receive correct amount after fees");
 
-        // STEP 9: Verify the direct signer key remained installed.
-        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), bytes32(0)), _testKeyHash());
+        // STEP 9: Verify the permission signer key remained installed.
+        assertEq(emvSigner.getAuthorizedKeyHash(address(kernel), _emvPermissionKey()), _testKeyHash());
 
         console.log("Complete end-to-end FFI EMV transaction successful!");
         console.log("Merchant received:", merchantReceived / 1e18, "tokens");

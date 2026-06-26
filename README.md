@@ -23,6 +23,7 @@ This project enables smart contract wallets to accept payment card transactions 
    - ERC-7579 signer module
    - Validates EMV P-256 signatures over the card-signed payload
    - Binds signatures to the configured card public key
+   - Does not support standalone validator installation; use it through a permission with policies
 
 2. **`EMVCardPolicy.sol`**
    - ERC-7579 policy module
@@ -205,11 +206,11 @@ The contracts employ several gas optimization techniques:
 ### Signature Scheme
 
 - **P-256 only**: EMVSigner verifies the card-signed SHA-256 payload with secp256r1.
-- Uses PKCS#1 v1.5 padding with SHA-256
+- Signature envelope binds the permission to the configured P-256 public key
 
 ### Target Validation
 
-- Validates both target address and function selector
+- ZeroDev CallPolicy validates both target address and function selector
 - Prevents signature reuse across different contexts
 
 ## Testing
