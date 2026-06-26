@@ -6,7 +6,6 @@ import {AcquirerConfig} from "../src/AcquirerConfig.sol";
 import {ColossusTestToken} from "../test/util/ColossusTestToken.sol";
 import {EMVSettlement} from "../src/EMVSettlement.sol";
 import {EMVValidator} from "../src/EMVValidator.sol";
-import {IERC7579Account} from "kernel/src/interfaces/IERC7579Account.sol";
 import {MODULE_TYPE_EXECUTOR, MODULE_TYPE_VALIDATOR} from "kernel/src/types/Constants.sol";
 
 contract SmokeBaseSepolia is Script {
@@ -54,10 +53,6 @@ contract SmokeBaseSepolia is Script {
         _assertTrue(settlement.isModuleType(MODULE_TYPE_EXECUTOR), "settlement executor module type");
         _assertTrue(settlement.isInitialized(address(0)), "settlement initialized");
 
-        (address validationTarget, bytes4 validationSelector) = validator.getValidationConfig();
-        _assertEqAddress(validationTarget, settlementAddress, "validator target");
-        _assertEqBytes4(validationSelector, IERC7579Account.execute.selector, "validator account selector");
-        _assertTrue(validationSelector != EMVSettlement.execute.selector, "validator must not use settlement selector");
         _assertTrue(validator.isModuleType(MODULE_TYPE_VALIDATOR), "validator module type");
 
         console2.log("Base Sepolia smoke test passed");
@@ -80,12 +75,6 @@ contract SmokeBaseSepolia is Script {
     }
 
     function _assertEqAddress(address actual, address expected, string memory check) private pure {
-        if (actual != expected) {
-            revert SmokeCheckFailed(check);
-        }
-    }
-
-    function _assertEqBytes4(bytes4 actual, bytes4 expected, string memory check) private pure {
         if (actual != expected) {
             revert SmokeCheckFailed(check);
         }

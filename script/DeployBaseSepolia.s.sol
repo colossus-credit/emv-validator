@@ -40,11 +40,7 @@ contract DeployBaseSepolia is Script {
         }
         acquirerConfig = new AcquirerConfig();
         emvSettlement = new EMVSettlement(address(token), address(acquirerConfig), uint8(tokenDecimals));
-        emvValidator = new EMVValidator(address(emvSettlement), validatorSelector());
-
-        (address validationTarget, bytes4 validationSelector) = emvValidator.getValidationConfig();
-        require(validationTarget == address(emvSettlement), "invalid validator target");
-        require(validationSelector == validatorSelector(), "invalid validator selector");
+        emvValidator = new EMVValidator();
 
         vm.stopBroadcast();
 
