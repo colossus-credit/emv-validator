@@ -63,6 +63,7 @@ contract AcquirerConfig is Ownable {
     event SwipeFeeUpdated(uint48 indexed acquirerId, uint256 oldFee, uint256 newFee);
 
     error InvalidAcquirerId();
+    error InvalidAcquirerAddress();
     error InvalidMerchantId();
     error InvalidMerchantAddress();
     error InvalidMerchantIdLength(uint256 length);
@@ -120,12 +121,9 @@ contract AcquirerConfig is Ownable {
         }
     }
 
-    function clearTransientStorage(FeeRecipient[] memory feeRecipients, uint256 length) external {
-        _clearTransientStorage(feeRecipients, length);
-    }
-
     function setAcquirer(uint48 acquirerId, address acquirerAddress) external onlyOwner {
         if (acquirerId == 0) revert InvalidAcquirerId();
+        if (acquirerAddress == address(0)) revert InvalidAcquirerAddress();
 
         acquirers[acquirerId] = acquirerAddress;
         emit AcquirerSet(acquirerId, acquirerAddress);

@@ -59,9 +59,8 @@ contract EMVSettlement {
 
     /**
      * @dev Install the module
-     * @param data Installation data (not used - configuration is set in constructor)
      */
-    function onInstall(bytes calldata data) external payable {
+    function onInstall(bytes calldata) external payable {
         // Configuration is set in constructor as immutable values
         // This function is called during module installation but config is already set
         emit EMVSettlementConfigured(msg.sender, configuredToken, address(0));
@@ -69,9 +68,8 @@ contract EMVSettlement {
 
     /**
      * @dev Uninstall the module
-     * @param data Uninstallation data (not used for this contract)
      */
-    function onUninstall(bytes calldata data) external payable {
+    function onUninstall(bytes calldata) external payable {
         // Configuration is immutable, nothing to clean up
     }
 
@@ -85,7 +83,7 @@ contract EMVSettlement {
     /**
      * @dev Check if module is initialized for the smart account
      */
-    function isInitialized(address smartAccount) external view returns (bool) {
+    function isInitialized(address) external view returns (bool) {
         // Configuration is immutable and set in constructor, so always initialized
         return configuredToken != address(0) && address(acquirerConfig) != address(0) && decimals >= 2;
     }
@@ -156,13 +154,17 @@ contract EMVSettlement {
      * @param totalAmount Total transaction amount
      */
     function _processFeePayments(AcquirerConfig.FeeRecipient[] memory feeRecipients, uint256 totalAmount) internal {
+        uint256 recipientCount = feeRecipients.length;
+        if (recipientCount == 0) revert InvalidFee(0);
+
         uint256 totalFees = 0;
 
         // Process all fees (excluding merchant)
         uint256 i = 0;
-        for (; i < feeRecipients.length - 1;) {
+        for (; i < recipientCount - 1;) {
             // Validate non-merchant fees are non-zero
             if (feeRecipients[i].fee == 0) revert InvalidFee(i);
+            if (feeRecipients[i].recipient == address(0)) revert InvalidFee(i);
 
             uint256 feeAmount = feeRecipients[i].fee;
             totalFees += feeAmount;
@@ -179,6 +181,7 @@ contract EMVSettlement {
         // Handle merchant payment (last recipient, fee must be 0)
         // i should now point to the last element (merchant)
         if (feeRecipients[i].fee != 0) revert InvalidMerchantFee();
+        if (feeRecipients[i].recipient == address(0)) revert InvalidFee(i);
 
         uint256 merchantAmount = totalAmount - totalFees;
         if (merchantAmount > 0) {

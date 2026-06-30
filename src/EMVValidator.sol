@@ -13,10 +13,12 @@ import {
     MODULE_TYPE_EXECUTOR,
     MODULE_TYPE_HOOK,
     ERC1271_MAGICVALUE,
-    ERC1271_INVALID
+    ERC1271_INVALID,
+    CALLTYPE_DELEGATECALL,
+    EXECTYPE_DEFAULT
 } from "kernel/src/types/Constants.sol";
 import {ExecLib} from "kernel/src/utils/ExecLib.sol";
-import {ExecMode, CallType} from "kernel/src/types/Types.sol";
+import {ExecMode, CallType, ExecType} from "kernel/src/types/Types.sol";
 
 struct EMVTransactionData {
     bytes iccDN; // 9F4C - ICC Dynamic Number (3 bytes) - REQUIRED for DDA
@@ -41,6 +43,8 @@ struct EMVTransactionData {
  * @notice Validates EMV CDA signatures and executes ERC20 transfers with merchant registry integration
  */
 contract EMVValidator is IValidator {
+    bytes4 private constant SETTLEMENT_EXECUTE_SELECTOR = bytes4(keccak256("execute(bytes)"));
+
     // ========== EVENTS ==========
 
     event ReplayProtectionUpdated(
@@ -106,6 +110,9 @@ contract EMVValidator is IValidator {
     error InvalidConfig();
     error InvalidTarget(address expected, address actual);
     error InvalidFunctionSelector(bytes4 expected, bytes4 actual);
+    error InvalidCallType(bytes1 actual);
+    error InvalidExecType(bytes1 actual);
+    error InvalidCallData();
     error InvalidSignatureLength(uint256 actualSize);
     error PublicKeyNotRegistered();
     error InvalidPublicKeySize();
@@ -225,12 +232,8 @@ contract EMVValidator is IValidator {
         override
         returns (uint256)
     {
-        // Note: userOp.callData should contain the kernel.execute() call with EMV fields
-        // We need to extract the EMV fields from within the execute call
+        // Bind validation to the exact Kernel delegatecall into EMVSettlement.execute(bytes).
         bytes calldata emvFields = _extractEMVFieldsFromCallData(userOp.callData);
-
-        // Validate that this EMV signature is being used for the correct target and function
-        _validateTargetAndSelector(userOp.callData);
 
         // Gas-optimized validation using calldata extraction instead of full memory expansion
         // Validate currency code from EMV fields
@@ -430,25 +433,8 @@ contract EMVValidator is IValidator {
      * @param callData The callData from PackedUserOperation containing kernel.execute(...)
      * @return emvFields The EMV transaction fields
      */
-    function _extractEMVFieldsFromCallData(bytes calldata callData) internal pure returns (bytes calldata emvFields) {
-        // Parse execute(ExecMode, bytes) call data structure:
-        // selector(4) + execMode(32) + offset(32) + length(32) + executionCalldata(variable)
-
-        // Get offset to executionCalldata (should be 0x40 = 64)
-        uint256 executionDataOffset = uint256(bytes32(callData[36:68]));
-
-        // ExecutionCalldata starts at: 4 + offset + 32 (skip length field)
-        uint256 executionDataStart = 4 + executionDataOffset + 32;
-
-        // For DELEGATECALL: decodeDelegate format (abi.encodePacked): target(20) + inner_calldata(variable)
-        // Skip target(20) bytes to get to inner calldata
-        uint256 innerCalldataStart = executionDataStart + 20;
-
-        // Inner = execute(bytes): selector(4) + offset(32) + length(32) + emvData. Skip 68 to emvData.
-        uint256 emvDataStart = innerCalldataStart + 68;
-        uint256 emvDataLength = uint256(bytes32(callData[innerCalldataStart + 36:innerCalldataStart + 68]));
-
-        return callData[emvDataStart:emvDataStart + emvDataLength];
+    function _extractEMVFieldsFromCallData(bytes calldata callData) internal view returns (bytes calldata emvFields) {
+        return _parseSettlementExecuteCall(callData);
     }
 
     /**
@@ -456,30 +442,75 @@ contract EMVValidator is IValidator {
      * @param callData The callData from the PackedUserOperation
      */
     function _validateTargetAndSelector(bytes calldata callData) internal view {
+        _parseSettlementExecuteCall(callData);
+    }
+
+    function _parseSettlementExecuteCall(bytes calldata callData) internal view returns (bytes calldata emvFields) {
+        if (callData.length < 4) revert InvalidCallData();
+
         bytes4 actualSelector = bytes4(callData[0:4]);
         if (actualSelector != selector) {
             revert InvalidFunctionSelector(selector, actualSelector);
         }
 
-        // Parse execute(ExecMode, bytes) call data structure:
-        // selector(4) + execMode(32) + offset(32) + length(32) + executionCalldata(variable)
+        if (callData.length < 68) revert InvalidCallData();
 
-        // Get offset to executionCalldata (should be 0x40 = 64)
+        ExecMode execMode = ExecMode.wrap(bytes32(callData[4:36]));
+        (CallType callType, ExecType execType,,) = ExecLib.decode(execMode);
+        if (callType != CALLTYPE_DELEGATECALL) {
+            revert InvalidCallType(CallType.unwrap(callType));
+        }
+        if (!(execType == EXECTYPE_DEFAULT)) {
+            revert InvalidExecType(ExecType.unwrap(execType));
+        }
+
         uint256 executionDataOffset = uint256(bytes32(callData[36:68]));
+        uint256 executionDataLengthOffset = 4 + executionDataOffset;
+        if (executionDataLengthOffset + 32 > callData.length) revert InvalidCallData();
 
-        // ExecutionCalldata starts at: 4 + offset + 32 (skip length field)
-        uint256 executionDataStart = 4 + executionDataOffset + 32;
+        uint256 executionDataLength =
+            uint256(bytes32(callData[executionDataLengthOffset:executionDataLengthOffset + 32]));
+        uint256 executionDataStart = executionDataLengthOffset + 32;
+        uint256 executionDataEnd = executionDataStart + executionDataLength;
+        if (executionDataEnd > callData.length) revert InvalidCallData();
+        if (executionDataStart + _paddedLength(executionDataLength) != callData.length) revert InvalidCallData();
 
-        // Extract target address from the beginning of executionCalldata (encodeSingle format)
-        // encodeSingle format: target(20) + value(32) + calldata(variable)
-        if (callData.length >= executionDataStart + 20) {
-            address actualTarget = address(bytes20(callData[executionDataStart:executionDataStart + 20]));
-            if (actualTarget != target) {
-                revert InvalidTarget(target, actualTarget);
-            }
-        } else {
+        if (executionDataLength < 20) {
             revert InvalidTarget(target, address(0));
         }
+
+        address actualTarget = address(bytes20(callData[executionDataStart:executionDataStart + 20]));
+        if (actualTarget != target) {
+            revert InvalidTarget(target, actualTarget);
+        }
+
+        uint256 innerCalldataStart = executionDataStart + 20;
+        uint256 innerCalldataLength = executionDataLength - 20;
+        uint256 innerCalldataEnd = innerCalldataStart + innerCalldataLength;
+        if (innerCalldataLength < 68) revert InvalidCallData();
+
+        bytes4 actualInnerSelector = bytes4(callData[innerCalldataStart:innerCalldataStart + 4]);
+        if (actualInnerSelector != SETTLEMENT_EXECUTE_SELECTOR) {
+            revert InvalidFunctionSelector(SETTLEMENT_EXECUTE_SELECTOR, actualInnerSelector);
+        }
+
+        uint256 emvDataOffset = uint256(bytes32(callData[innerCalldataStart + 4:innerCalldataStart + 36]));
+        if (emvDataOffset != 32) revert InvalidCallData();
+
+        uint256 emvDataLengthOffset = innerCalldataStart + 4 + emvDataOffset;
+        if (emvDataLengthOffset + 32 > innerCalldataEnd) revert InvalidCallData();
+
+        uint256 emvDataLength = uint256(bytes32(callData[emvDataLengthOffset:emvDataLengthOffset + 32]));
+        uint256 emvDataStart = emvDataLengthOffset + 32;
+        uint256 emvDataEnd = emvDataStart + emvDataLength;
+        if (emvDataEnd > innerCalldataEnd) revert InvalidCallData();
+        if (emvDataStart + _paddedLength(emvDataLength) != innerCalldataEnd) revert InvalidCallData();
+
+        return callData[emvDataStart:emvDataEnd];
+    }
+
+    function _paddedLength(uint256 length) internal pure returns (uint256) {
+        return (length + 31) & ~uint256(31);
     }
 
     // ========== GAS-OPTIMIZED CALLDATA EXTRACTION ==========
