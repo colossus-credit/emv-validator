@@ -978,17 +978,9 @@ contract EMVValidatorTest is KernelTestBase {
         assertTrue(foundAccumulated, "Should find the accumulated fee recipient");
     }
 
-    function test_ClearTransientStorageFunction() public {
-        // Create a simple fee recipients array
-        AcquirerConfig.FeeRecipient[] memory testRecipients = new AcquirerConfig.FeeRecipient[](2);
-        testRecipients[0] = AcquirerConfig.FeeRecipient({fee: 100, recipient: makeAddr("recipient1")});
-        testRecipients[1] = AcquirerConfig.FeeRecipient({fee: 200, recipient: makeAddr("recipient2")});
-
-        // Test that the public clearTransientStorage function exists and can be called
-        acquirerConfig.clearTransientStorage(testRecipients, 2);
-
-        // If we get here without reverting, the function works
-        assertTrue(true, "clearTransientStorage function should be callable");
+    function test_AcquirerConfigRejectsZeroAcquirerAddress() public {
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerAddress.selector);
+        acquirerConfig.setAcquirer(bytesToUint48(bytes6("TESTAQ")), address(0));
     }
 
     function test_AllDifferentFeeRecipients() public {
