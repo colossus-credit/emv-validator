@@ -7,9 +7,9 @@ import {Ownable} from "solady/auth/Ownable.sol";
 
 /**
  * @title AcquirerConfig
- * @dev Registry for merchant-selected acquirers with acquirer, swipe, interchange, and network fees.
+ * @dev Registry for owner-approved acquirers with acquirer-managed merchants and fee configuration.
  * @notice Merchant IDs are merchant-chosen 15-byte identifiers (e.g. a 15-char ASCII id carried in
- *         EMV tag 9F16) bound to the registrant's address via setMerchant; first-come, no anti-squat.
+ *         EMV tag 9F16) bound to merchant addresses by the registered acquirer.
  */
 contract AcquirerConfig is Ownable {
     struct FeeRecipient {
@@ -64,12 +64,12 @@ contract AcquirerConfig is Ownable {
 
     error InvalidAcquirerId();
     error InvalidMerchantId();
+    error InvalidMerchantAddress();
     error InvalidMerchantIdLength(uint256 length);
     error InvalidFeeRate();
     error InvalidFee(uint256 position);
     error InvalidMerchantFee();
     error UnauthorizedAcquirer(uint48 acquirerId, address caller);
-    error UnauthorizedMerchant(uint120 merchantId, address caller);
     error UnknownMerchant(uint120 merchantId);
 
     modifier onlyAcquirer(uint48 acquirerId) {
@@ -131,38 +131,43 @@ contract AcquirerConfig is Ownable {
         emit AcquirerSet(acquirerId, acquirerAddress);
     }
 
-    function setMerchant(uint120 merchantId, uint48 acquirerId) external {
-        _setMerchant(merchantId, acquirerId);
+    function setMerchant(uint120 merchantId, uint48 acquirerId, address merchant) external onlyAcquirer(acquirerId) {
+        _setMerchant(merchantId, acquirerId, merchant);
     }
 
-    function setMerchant(string calldata merchantIdANSString, uint48 acquirerId) external {
+    function setMerchant(string calldata merchantIdANSString, uint48 acquirerId, address merchant)
+        external
+        onlyAcquirer(acquirerId)
+    {
         bytes memory encodedMerchantId = ANSEncoding.encode(merchantIdANSString);
         uint256 length = encodedMerchantId.length;
         if (length > MERCHANT_ID_MAX_LENGTH) revert InvalidMerchantIdLength(length);
 
-        _setMerchant(uint120(bytes15(encodedMerchantId)), acquirerId);
+        _setMerchant(uint120(bytes15(encodedMerchantId)), acquirerId, merchant);
     }
 
-    function _setMerchant(uint120 merchantId, uint48 acquirerId) internal {
-        if (acquirers[acquirerId] == address(0)) revert InvalidAcquirerId();
+    function _setMerchant(uint120 merchantId, uint48 acquirerId, address merchant) internal {
         if (merchantId == 0) revert InvalidMerchantId();
+        if (merchant == address(0)) revert InvalidMerchantAddress();
 
-        address currentMerchant = merchantData[merchantId].merchant;
-        if (currentMerchant != address(0) && currentMerchant != msg.sender) {
-            revert UnauthorizedMerchant(merchantId, msg.sender);
+        MerchantData memory currentMerchant = merchantData[merchantId];
+        if (currentMerchant.merchant != address(0) && currentMerchant.acquirerId != acquirerId) {
+            revert UnauthorizedAcquirer(currentMerchant.acquirerId, msg.sender);
         }
 
-        merchantData[merchantId] = MerchantData({merchant: msg.sender, acquirerId: acquirerId});
-        emit MerchantSet(acquirerId, merchantId, msg.sender);
+        merchantData[merchantId] = MerchantData({merchant: merchant, acquirerId: acquirerId});
+        emit MerchantSet(acquirerId, merchantId, merchant);
     }
 
     function removeMerchant(uint120 merchantId) external {
         MerchantData memory merchant = merchantData[merchantId];
         if (merchant.merchant == address(0)) revert UnknownMerchant(merchantId);
-        if (merchant.merchant != msg.sender) revert UnauthorizedMerchant(merchantId, msg.sender);
+        if (acquirers[merchant.acquirerId] != msg.sender) {
+            revert UnauthorizedAcquirer(merchant.acquirerId, msg.sender);
+        }
 
         delete merchantData[merchantId];
-        emit MerchantRemoved(merchant.acquirerId, merchantId, msg.sender);
+        emit MerchantRemoved(merchant.acquirerId, merchantId, merchant.merchant);
     }
 
     function getMerchantAddress(uint120 merchantId) external view returns (address) {
