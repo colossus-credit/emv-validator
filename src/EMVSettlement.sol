@@ -3,6 +3,7 @@
 pragma solidity ^0.8.23;
 
 import {AcquirerConfig} from "./AcquirerConfig.sol";
+import {BCDEncoding} from "./util/BCDEncoding.sol";
 import {MODULE_TYPE_EXECUTOR} from "kernel/src/types/Constants.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
@@ -103,7 +104,7 @@ contract EMVSettlement {
         uint120 merchantId = uint120(bytes15(emvData[merchantOffset:merchantOffset + 15]));
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
-        uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
+        uint256 transferAmount = BCDEncoding.extractAmountFromBCD(amountBytes, decimals);
 
         if (transferAmount == 0) {
             revert InvalidAmount();
@@ -183,37 +184,5 @@ contract EMVSettlement {
         if (merchantAmount > 0) {
             SafeTransferLib.safeTransfer(configuredToken, feeRecipients[i].recipient, merchantAmount);
         }
-    }
-
-    /**
-     * @dev Extract amount from EMV BCD format
-     * @param bcdAmount 6-byte BCD encoded amount
-     * @param tokenDecimals Number of decimals for the token
-     * @return Amount in token units based on provided decimals
-     */
-    function _extractAmountFromBCD(bytes calldata bcdAmount, uint8 tokenDecimals) internal pure returns (uint256) {
-        if (bcdAmount.length != 6) {
-            revert InvalidBCDLength();
-        }
-
-        uint256 amount = 0;
-        for (uint256 i = 0; i < 6; i++) {
-            uint8 byte_val = uint8(bcdAmount[i]);
-            uint8 high_nibble = byte_val >> 4;
-            uint8 low_nibble = byte_val & 0x0F;
-
-            // Validate BCD digits (0-9)
-            if (high_nibble > 9 || low_nibble > 9) {
-                return 0;
-            }
-
-            amount = amount * 100 + high_nibble * 10 + low_nibble;
-        }
-
-        // Convert from cents to token units using provided decimals
-        // EMV amounts are typically in cents (2 decimal places)
-        // So we need to convert: cents -> token units
-        // Example: If token has 6 decimals, multiply by 10^(6-2) = 10^4
-        return amount * 10 ** (tokenDecimals - 2);
     }
 }
